@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class WDistLoss(nn.Module):
@@ -7,22 +8,34 @@ class WDistLoss(nn.Module):
 
     target should have values of 0 (False) or 1 (True)
     """
+
     def __init__(self):
         super().__init__()
 
-    def forward(self, input, target):
-        return wasserstein_distance_loss(input, target)
+    def forward(self, D_fake, D_real=None):
+        if D_real is None:
+            return self._forward_G(D_fake)
+        else:
+            return self._forward_D(D_fake, D_real)
+
+    def _forward_G(self, D_fake):
+        return -D_fake.mean()
+
+    def _forward_D(self, D_fake, D_real):
+        # hinge loss
+        d_loss_real = F.relu(1.0 - D_real).mean()
+        d_loss_fake = F.relu(1.0 + D_fake).mean()
+        return d_loss_real, d_loss_fake
 
 
 def wasserstein_distance_loss(input, target):
     sign = 2 * target - 1
 
-    return - (sign * input).mean()
+    return -(sign * input).mean()
 
 
 def wgan_grad_penalty(critic, x, y, lam=10, *args, **kwargs):
-    """Calculate the gradient penalty for WGAN
-    """
+    """Calculate the gradient penalty for WGAN"""
     device = x.device
     batch_size = x.shape[0]
     alpha = torch.rand(batch_size, device=device)
@@ -36,7 +49,7 @@ def wgan_grad_penalty(critic, x, y, lam=10, *args, **kwargs):
     # sum over batches because graphs are mostly independent (w/o batchnorm)
     score = score.sum()
 
-    grad, = torch.autograd.grad(
+    (grad,) = torch.autograd.grad(
         score,
         xy,
         retain_graph=True,

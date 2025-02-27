@@ -3,12 +3,13 @@ import torch
 import numpy as np
 import matplotlib
 
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, LogNorm, SymLogNorm
 from matplotlib.cm import ScalarMappable
 
-plt.rc('text', usetex=False)
+plt.rc("text", usetex=False)
 
 from ..models import lag2eul, power
 
@@ -28,7 +29,7 @@ def area_under_curve(x1, pwr1, x2, pwr2):
     s1 = np.trapz(curve1, x1)
     s2 = np.trapz(curve2, x2)
 
-    return s1/s2
+    return s1 / s2
 
 
 def score(*fields, labels=None):
@@ -44,20 +45,19 @@ def score(*fields, labels=None):
     ks = [k.cpu().numpy() for k in ks]
     ps = [P.cpu().numpy() for P in ps]
 
-    if labels[0] is 'output' and labels[1] is 'target':
+    if labels[0] is "output" and labels[1] is "target":
         return area_under_curve(ks[0], ps[0], ks[1], ps[1])
     else:
         return area_under_curve(ks[1], ps[1], ks[0], ps[0])
 
 
-
-def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
+def plt_slices(*fields, size=None, title=None, cmap=None, norm=None, **kwargs):
     """Plot slices of fields of more than 2 spatial dimensions.
 
     Each field should have a channel dimension followed by spatial dimensions,
     i.e. no batch dimension.
     """
-    plt.close('all')
+    plt.close("all")
 
     assert all(isinstance(field, torch.Tensor) for field in fields)
 
@@ -71,14 +71,15 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
     cmap = np.broadcast_to(cmap, (nf,))
     norm = np.broadcast_to(norm, (nf,))
 
-    im_size = 2
+    im_size = 4
     cbar_height = 0.2
     fig, axes = plt.subplots(
-        nc + 1, nf,
+        nc + 1,
+        nf,
         squeeze=False,
         figsize=(nf * im_size, nc * im_size + cbar_height),
         dpi=100,
-        gridspec_kw={'height_ratios': nc * [im_size] + [cbar_height]}
+        gridspec_kw={"height_ratios": nc * [im_size] + [cbar_height]},
     )
 
     for f, (field, cmap_col, norm_col) in enumerate(zip(fields, cmap, norm)):
@@ -87,11 +88,11 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
 
         if cmap_col is None:
             if all_non_neg:
-                cmap_col = 'inferno'
+                cmap_col = "inferno"
             elif all_non_pos:
-                cmap_col = 'inferno_r'
+                cmap_col = "inferno_r"
             else:
-                cmap_col = 'RdBu_r'
+                cmap_col = "RdBu_r"
 
         if norm_col is None:
             l2, l1, h1, h2 = np.percentile(field, [2.5, 16, 84, 97.5])
@@ -106,9 +107,11 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
                 if l1 < 0.1 * l2 or h2 == 0:
                     norm_col = Normalize(vmin=-quantize(-l2), vmax=0)
                 else:
-                    norm_col = SymLogNorm(linthresh=quantize(-h2),
-                                          vmin=-quantize(-l2),
-                                          vmax=-quantize(-h2))
+                    norm_col = SymLogNorm(
+                        linthresh=quantize(-h2),
+                        vmin=-quantize(-l2),
+                        vmax=-quantize(-h2),
+                    )
             else:
                 vlim = quantize(max(-l2, h2))
                 if w1 > 0.1 * w2 or l1 * h1 >= 0:
@@ -116,8 +119,13 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
                 else:
                     linthresh = quantize(min(-l1, h1))
                     linscale = np.log10(vlim / linthresh)
-                    norm_col = SymLogNorm(linthresh=linthresh, linscale=linscale,
-                                          vmin=-vlim, vmax=vlim, base=10)
+                    norm_col = SymLogNorm(
+                        linthresh=linthresh,
+                        linscale=linscale,
+                        vmin=-vlim,
+                        vmax=vlim,
+                        base=10,
+                    )
 
         for c in range(field.shape[0]):
             s = (c,) + tuple(d // 2 for d in field.shape[1:-2])
@@ -137,7 +145,7 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
 
             axes[c, f].pcolormesh(field[s], cmap=cmap_col, norm=norm_col)
 
-            axes[c, f].set_aspect('equal')
+            axes[c, f].set_aspect("equal")
 
             axes[c, f].set_xticks([])
             axes[c, f].set_yticks([])
@@ -146,12 +154,12 @@ def plt_slices(*fields, size=64, title=None, cmap=None, norm=None, **kwargs):
                 axes[c, f].set_title(title[f])
 
         for c in range(field.shape[0], nc):
-            axes[c, f].axis('off')
+            axes[c, f].axis("off")
 
         fig.colorbar(
             ScalarMappable(norm=norm_col, cmap=cmap_col),
             cax=axes[-1, f],
-            orientation='horizontal',
+            orientation="horizontal",
         )
 
     fig.tight_layout()
@@ -169,7 +177,7 @@ def plt_power(*fields, dis=None, label=None, **kwargs):
 
     See `map2map.models.power`.
     """
-    plt.close('all')
+    plt.close("all")
 
     if label is not None:
         assert len(label) == len(fields) or len(label) == len(dis)
@@ -195,8 +203,8 @@ def plt_power(*fields, dis=None, label=None, **kwargs):
         axes.loglog(k, P, label=l, alpha=0.7)
 
     axes.legend()
-    axes.set_xlabel('unnormalized wavenumber')
-    axes.set_ylabel('unnormalized power')
+    axes.set_xlabel("unnormalized wavenumber")
+    axes.set_ylabel("unnormalized power")
 
     fig.tight_layout()
 

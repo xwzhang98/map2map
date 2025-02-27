@@ -34,7 +34,7 @@ class LinearElr(nn.Module):
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_size))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         self.act = act
 
@@ -55,20 +55,19 @@ class ConvElr3d(nn.Module):
     Useful at all if not for regularization(1706.05350)?
     """
 
-    def __init__(self, in_chan, out_chan, kernel_size,
-                 stride=1, padding=0, bias=True):
+    def __init__(self, in_chan, out_chan, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
 
         self.weight = nn.Parameter(
             torch.randn(out_chan, in_chan, *(kernel_size,) * 3),
         )
-        fan_in = in_chan * kernel_size ** 3
+        fan_in = in_chan * kernel_size**3
         self.wnorm = 1 / math.sqrt(fan_in)
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_chan))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         self.stride = stride
         self.padding = padding
@@ -91,8 +90,16 @@ class ConvStyled3d(nn.Module):
     Weight and bias initialization from `torch.nn._ConvNd.reset_parameters()`.
     """
 
-    def __init__(self, in_chan, out_chan, style_size, kernel_size=3, stride=1,
-                 bias=True, resample=None):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        style_size,
+        kernel_size=3,
+        stride=1,
+        bias=True,
+        resample=None,
+    ):
         super().__init__()
 
         # self.style_weight = nn.Parameter(torch.empty(in_chan, style_size))
@@ -105,25 +112,26 @@ class ConvStyled3d(nn.Module):
             self.weight = nn.Parameter(torch.empty(out_chan, in_chan, *K3))
             self.stride = stride
             self.conv = F.conv3d
-        elif resample == 'U':
+        elif resample == "U":
             K3 = (2,) * 3
             # NOTE not clear to me why convtranspose have channels swapped
             self.weight = nn.Parameter(torch.empty(in_chan, out_chan, *K3))
             self.stride = 2
             self.conv = F.conv_transpose3d
-        elif resample == 'D':
+        elif resample == "D":
             K3 = (2,) * 3
             self.weight = nn.Parameter(torch.empty(out_chan, in_chan, *K3))
             self.stride = 2
             self.conv = F.conv3d
         else:
-            raise ValueError('resample type {} not supported'.format(resample))
+            raise ValueError("resample type {} not supported".format(resample))
         self.resample = resample
 
         nn.init.kaiming_uniform_(
-            self.weight, a=math.sqrt(5),
-            mode='fan_in',  # effectively 'fan_out' for 'D'
-            nonlinearity='leaky_relu',
+            self.weight,
+            a=math.sqrt(5),
+            mode="fan_in",  # effectively 'fan_out' for 'D'
+            nonlinearity="leaky_relu",
         )
 
         if bias:
@@ -132,11 +140,13 @@ class ConvStyled3d(nn.Module):
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         def init_weight(m):
             if type(m) is nn.Linear:
-                torch.nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5), mode='fan_in', nonlinearity='leaky_relu')
+                torch.nn.init.kaiming_uniform_(
+                    m.weight, a=math.sqrt(5), mode="fan_in", nonlinearity="leaky_relu"
+                )
                 if m.bias is not None:
                     torch.nn.init.ones_(m.bias)
 
@@ -153,7 +163,7 @@ class ConvStyled3d(nn.Module):
 
         C0, C1, *K3 = self.weight.shape
 
-        if self.resample == 'U':
+        if self.resample == "U":
             Cin, Cout = C0, C1
         else:
             Cout, Cin = C0, C1
@@ -161,14 +171,14 @@ class ConvStyled3d(nn.Module):
         # s = F.linear(s, self.style_weight, bias=self.style_bias)
         s = self.style_block(s)
         # modulation
-        if self.resample == 'U':
+        if self.resample == "U":
             s = s.reshape(N, Cin, 1, 1, 1, 1)
         else:
             s = s.reshape(N, 1, Cin, 1, 1, 1)
         w = self.weight * s
         # print(Cin, 'Cin2')
         # demodulation
-        if self.resample == 'U':
+        if self.resample == "U":
             fan_in_dim = (1, 3, 4, 5)
         else:
             fan_in_dim = (2, 3, 4, 5)
@@ -189,7 +199,7 @@ class ConvStyled3d(nn.Module):
 
 
 class BatchNormStyled3d(nn.BatchNorm3d):
-    """ Trivially does standard batch normalization, but accepts second argument
+    """Trivially does standard batch normalization, but accepts second argument
 
     for style array that is not used
     """
@@ -226,3 +236,76 @@ class LeakyReLUStyled2(nn.LeakyReLU):
         x = inputs[0]
         return super().forward(x)
 
+
+class ModulatedConv3d(nn.Module):
+    """Convolution layer with modulation and demodulation, from StyleGAN2.
+
+    Weight and bias initialization from `torch.nn._ConvNd.reset_parameters()`.
+    """
+
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        embedding_size,
+        kernel_size=3,
+        stride=1,
+        bias=True,
+        demodulation=True,
+    ):
+        super().__init__()
+
+        K3 = (kernel_size,) * 3
+        self.weight = nn.Parameter(torch.empty(out_chan, in_chan, *K3))
+        self.stride = stride
+        self.conv = F.conv3d
+        self.demodulation = demodulation
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_chan))
+        else:
+            self.register_parameter("bias", None)
+
+        self.embed_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(embedding_size, in_chan),
+        )
+
+    def forward(self, x, style):
+        # x shape N, C, D, H, W
+        # style shape N, embedding_size
+        s = self.embed_layers(style)  # N, in_chan
+
+        eps = 1e-16
+
+        batch, _, *DHW_in = x.shape
+        w = self.weight
+        chan_out, chan_in, *K = w.shape
+
+        # Pre-normalize inputs
+        # if self.demodulation:
+        #     w = w * w.square().mean([1, 2, 3, 4], keepdim=True).rsqrt()
+        #     s = s * s.square().mean().rsqrt()
+
+        # Modulate weights
+        w = w.unsqueeze(0)  # [1OIkkk]
+        s = s.unsqueeze(1).unsqueeze(3).unsqueeze(4).unsqueeze(5)  # [N1I111]
+        w = w * s  # [NOIkkk]
+
+        # Demodulate weights
+        if self.demodulation:
+            coeff = torch.rsqrt(torch.sum(w.pow(2), dim=[2, 3, 4, 5]) + eps)  # [NO]
+            coeff = (
+                coeff.unsqueeze(2).unsqueeze(3).unsqueeze(4).unsqueeze(5)
+            )  # [NO1111]
+            w = w * coeff  # [NOIkkk]
+
+        w = w.reshape(batch * chan_out, chan_in, *K)
+        x = x.reshape(1, batch * chan_in, *DHW_in)
+        # END HERE
+        x = self.conv(x, w, bias=self.bias, stride=self.stride, groups=batch)
+        _, _, *DHW_out = x.shape
+
+        x = x.view(batch, chan_out, *DHW_out)
+
+        return x

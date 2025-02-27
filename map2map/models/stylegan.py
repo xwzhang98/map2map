@@ -1,0 +1,391 @@
+import math
+import torch
+import torch.nn as nn
+from .style import ModulatedConv3d
+from .resample import Resampler
+
+
+def normalization(channels):
+    return nn.GroupNorm(num_groups=32, num_channels=channels, eps=1e-16, affine=True)
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def narrow_as(x, y):
+    """
+    _summary_
+
+    Args:
+        x (tensor): tensor to narrow, shape must be larger than y
+        y (tensor): tensor to narrow to
+
+    Returns:
+        _type_: new x that is narrow to y
+    """
+    # x N C D H W
+    # y N C d h w
+    if x.size() == y.size():
+        return x
+    else:
+        edge = (x.size()[-1] - y.size()[-1]) // 2
+        for d in range(2, x.dim()):
+            x = x.narrow(d, edge, x.size()[d] - 2 * edge)
+        return x
+
+
+class NoiseInjection(nn.Module):
+    """Add or concatenate noise.
+
+    Add noise if `cat=False`.
+    The number of channels `chan` should be 1 (StyleGAN2)
+    or that of the input (StyleGAN).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.std = nn.Parameter(torch.zeros(1), requires_grad=True)
+
+    def forward(self, x, noise=None):
+        if noise is None:
+            batch, channels, height, width, depth = x.size()
+            noise = torch.randn(batch, 1, height, width, depth).to(x.device)
+        return x + self.std * noise
+
+
+class HBlock(nn.Module):
+    """The "H" block of the StyleGAN2 generator.
+
+        x_p                     y_p
+         |                       |
+    convolution           linear upsample
+         |                       |
+          >--- projection ------>+
+         |                       |
+         v                       v
+        x_n                     y_n
+
+    See Fig. 7 (b) upper in https://arxiv.org/abs/1912.04958
+    Upsampling are all linear, not transposed convolution.
+
+    Parameters
+    ----------
+    prev_chan : number of channels of x_p
+    next_chan : number of channels of x_n
+    out_chan : number of channels of y_p and y_n
+    embedding_size : size of embedding
+
+    Notes
+    -----
+    next_size = 2 * prev_size - 6
+    """
+
+    def __init__(
+        self,
+        prev_chan,
+        next_chan,
+        out_chan,
+        embedding_size,
+        inject_noise=True,
+        use_normalize=True,
+    ):
+        super().__init__()
+
+        self.embedding_size = embedding_size
+        self.inject_noise = inject_noise
+        self.upsample = Resampler(ndim=3, scale_factor=2, narrow=True)
+        self.use_normalize = use_normalize
+
+        if self.inject_noise:
+            self.noise1 = NoiseInjection()
+            self.noise2 = NoiseInjection()
+
+        if self.use_normalize:
+            self.normalize1 = normalization(next_chan)
+            self.normalize2 = normalization(next_chan)
+
+        self.conv1 = ModulatedConv3d(
+            in_chan=prev_chan,
+            out_chan=next_chan,
+            embedding_size=embedding_size,
+            kernel_size=3,
+            demodulation=True,
+        )
+        self.act1 = nn.SiLU(inplace=True)
+
+        self.conv2 = ModulatedConv3d(
+            in_chan=next_chan,
+            out_chan=next_chan,
+            embedding_size=embedding_size,
+            kernel_size=3,
+            demodulation=True,
+        )
+        self.act2 = nn.SiLU(inplace=True)
+
+        self.proj = nn.Sequential(
+            ModulatedConv3d(
+                in_chan=next_chan,
+                out_chan=out_chan,
+                embedding_size=embedding_size,
+                kernel_size=1,
+                demodulation=True,
+            ),
+            nn.SiLU(),
+        )
+
+    def forward(self, x, y, s):
+        # left branch:
+        x = self.upsample(x)
+        # block 1
+        # ---------------------
+        x = self.conv1(x, s)
+        if self.inject_noise:
+            x = self.noise1(x)
+        if self.use_normalize:
+            x = self.normalize1(x)
+        x = self.act1(x)
+        # ---------------------
+        # block 1
+        # ---------------------
+        x = self.conv2(x, s)
+        if self.inject_noise:
+            x = self.noise2(x)
+        if self.use_normalize:
+            x = self.normalize2(x)
+        x = self.act2(x)
+        # ---------------------
+        # right branch
+        y = self.upsample(y)
+        y = narrow_as(y, x)
+        y = y + self.proj(x, s)
+        return x, y
+
+
+class G(nn.Module):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        style_size,
+        embedding_size,
+        scale_factor=8,
+        chan_base=512,
+        chan_min=64,
+        chan_max=512,
+        inject_noise=False,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.in_chan = in_chan
+        self.out_chan = out_chan
+        self.style_size = style_size
+        self.embedding_size = embedding_size
+        self.scale_factor = scale_factor
+        num_blocks = round(math.log2(self.scale_factor))
+        self.num_blocks = num_blocks
+        self.inject_noise = inject_noise
+
+        assert chan_min <= chan_max
+
+        def chan(b):
+            c = chan_base >> b
+            c = max(c, chan_min)
+            c = min(c, chan_max)
+            return c
+
+        self.head = ModulatedConv3d(
+            in_chan=in_chan,
+            out_chan=chan(0),
+            embedding_size=embedding_size,
+            kernel_size=1,
+            demodulation=True,
+        )
+
+        self.style_embed = nn.Sequential(
+            nn.Linear(style_size, embedding_size),
+            nn.SiLU(),
+            nn.Linear(embedding_size, embedding_size),
+        )
+
+        self.blocks = nn.ModuleList()
+        for b in range(num_blocks):
+            prev_chan, next_chan = chan(b), chan(b + 1)
+            self.blocks.append(
+                HBlock(
+                    prev_chan=prev_chan,
+                    next_chan=next_chan,
+                    out_chan=out_chan,
+                    embedding_size=embedding_size,
+                    inject_noise=inject_noise,
+                )
+            )
+
+    def forward(self, x, style):
+        s = self.style_embed(style)
+        y = x  # direct from the input without toRGB
+        x = self.head(x, s)  # shallow feature extraction
+
+        for block in self.blocks:
+            x, y = block(x, y, s)
+
+        return y
+
+
+class ModulatedResidualBlock(nn.Module):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        embedding_size,
+        kernel_size=3,
+        stride=1,
+    ):
+        super().__init__()
+        self.in_chan = in_chan
+        self.out_chan = out_chan
+        self.embedding_size = embedding_size
+        self.kernel_size = kernel_size
+        self.stride = stride
+
+        self.conv1 = ModulatedConv3d(
+            in_chan=in_chan,
+            out_chan=out_chan,
+            embedding_size=embedding_size,
+            kernel_size=kernel_size,
+            stride=stride,
+            demodulation=True,
+        )
+        self.act1 = nn.SiLU(inplace=True)
+
+        self.conv2 = ModulatedConv3d(
+            in_chan=out_chan,
+            out_chan=out_chan,
+            embedding_size=embedding_size,
+            kernel_size=kernel_size,
+            stride=stride,
+            demodulation=True,
+        )
+        self.act2 = nn.SiLU(inplace=True)
+
+        self.skip = ModulatedConv3d(
+            in_chan=in_chan,
+            out_chan=out_chan,
+            embedding_size=embedding_size,
+            kernel_size=1,
+            stride=1,
+            demodulation=True,
+        )
+
+    def forward(self, x, style):
+        # skip branch
+        skip = self.skip(x, style)
+        # main branch
+        x = self.conv1(x, style)
+        x = self.act1(x)
+        x = self.conv2(x, style)
+        x = self.act2(x)
+
+        return x + skip
+
+
+class D(nn.Module):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        style_size,
+        embedding_size,
+        scale_factor=8,
+        chan_base=512,
+        chan_min=64,
+        chan_max=512,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.in_chan = in_chan
+        self.out_chan = out_chan
+        self.style_size = style_size
+        self.scale_factor = scale_factor
+        num_blocks = round(math.log2(self.scale_factor))
+        self.num_blocks = num_blocks
+        self.embedding_size = embedding_size
+
+        assert chan_min <= chan_max
+
+        def chan(b):
+            if b >= 0:
+                c = chan_base >> b
+            else:
+                c = chan_base << -b
+            c = max(c, chan_min)
+            c = min(c, chan_max)
+            return c
+
+        self.head = ModulatedConv3d(
+            in_chan=in_chan
+            + 8,  # FIXME here I hard coded the in_chan+8 to meet the dimension after eul_scale_factor 2
+            out_chan=chan(num_blocks),
+            embedding_size=embedding_size,
+            kernel_size=1,
+        )
+        self.head_act = nn.SiLU(inplace=True)
+
+        self.style_embed = nn.Sequential(
+            nn.Linear(style_size, embedding_size),
+            nn.SiLU(),
+            nn.Linear(embedding_size, embedding_size),
+        )
+
+        self.downsample = Resampler(ndim=3, scale_factor=0.5)
+
+        self.blocks = nn.ModuleList()
+        for b in reversed(range(num_blocks)):
+            prev_chan, next_chan = chan(b + 1), chan(b)
+            self.blocks.append(
+                ModulatedResidualBlock(
+                    in_chan=prev_chan,
+                    out_chan=next_chan,
+                    embedding_size=embedding_size,
+                )
+            )
+
+        self.conv1 = ModulatedConv3d(
+            in_chan=chan(0),
+            out_chan=chan(-1),
+            embedding_size=embedding_size,
+            kernel_size=1,
+        )
+
+        self.act1 = nn.SiLU(inplace=True)
+
+        self.out = ModulatedConv3d(
+            in_chan=chan(-1),
+            out_chan=out_chan,
+            embedding_size=embedding_size,
+            kernel_size=1,
+        )
+
+    def forward(self, x, style):
+        s = self.style_embed(style)
+
+        x = self.head(x, s)
+        x = self.head_act(x)
+
+        for block in self.blocks:
+            x = block(x, s)
+            x = self.downsample(x)
+
+        x = self.conv1(x, s)
+        x = self.act1(x)
+        x = self.out(x, s)
+
+        return x

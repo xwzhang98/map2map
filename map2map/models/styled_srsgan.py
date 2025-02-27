@@ -18,14 +18,26 @@ class mySequential(nn.Sequential):
 
 
 class G(nn.Module):
-    def __init__(self, in_chan, out_chan, style_size, scale_factor=16,
-                 chan_base=512, chan_min=64, chan_max=512, cat_noise=False,
-                 **kwargs):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        style_size,
+        scale_factor=8,
+        chan_base=512,
+        chan_min=64,
+        chan_max=512,
+        cat_noise=False,
+        **kwargs
+    ):
         super().__init__()
 
+        self.in_chan = in_chan
+        self.out_chan = out_chan
         self.style_size = style_size
         self.scale_factor = scale_factor
         num_blocks = round(log2(self.scale_factor))
+        self.num_blocks = num_blocks
 
         assert chan_min <= chan_max
 
@@ -35,6 +47,12 @@ class G(nn.Module):
             c = min(c, chan_max)
             return c
 
+        self.in_layer = nn.ModuleList(
+            [
+                ConvStyled3d(in_chan, chan(0), self.style_size, kernal_size=1),
+                LeakyReLUStyled(0.2, inplace=True),
+            ]
+        )
         self.block0 = nn.Sequential(
             ConvStyled3d(in_chan, chan(0), self.style_size, 1),
             LeakyReLUStyled(0.2, True),
@@ -44,7 +62,8 @@ class G(nn.Module):
         for b in range(num_blocks):
             prev_chan, next_chan = chan(b), chan(b + 1)
             self.blocks.append(
-                HBlock(prev_chan, next_chan, out_chan, cat_noise, style_size))
+                HBlock(prev_chan, next_chan, out_chan, cat_noise, style_size)
+            )
 
     def forward(self, x, style):
         s = style
@@ -101,8 +120,8 @@ class HBlock(nn.Module):
             ConvStyled3d(prev_chan + int(cat_noise), next_chan, style_size, 3),
             LeakyReLUStyled(0.2, True),
         )
-        self.addnoise = AddNoise(cat_noise, chan=next_chan) 
-        
+        self.addnoise = AddNoise(cat_noise, chan=next_chan)
+
         self.conv1 = nn.Sequential(
             ConvStyled3d(next_chan + int(cat_noise), next_chan, style_size, 3),
             LeakyReLUStyled(0.2, True),
@@ -115,17 +134,17 @@ class HBlock(nn.Module):
 
     def forward(self, x, y, s):
         x = self.noise_upsample(x)
-        x = self.conv((x,s))
+        x = self.conv((x, s))
         x = self.addnoise(x)
-        x = self.conv1((x,s))
+        x = self.conv1((x, s))
 
         if y is None:
-            y = self.proj((x,s))
+            y = self.proj((x, s))
         else:
-            y = self.upsample(y)  
+            y = self.upsample(y)
 
             y = narrow_by(y, 2)
-            y = y + self.proj((x,s))
+            y = y + self.proj((x, s))
         return x, y, s
 
 
@@ -160,9 +179,17 @@ class AddNoise(nn.Module):
 
 
 class D(nn.Module):
-    def __init__(self, in_chan, out_chan, style_size, scale_factor=8,
-                 chan_base=512, chan_min=64, chan_max=512,
-                 **kwargs):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        style_size,
+        scale_factor=8,
+        chan_base=512,
+        chan_min=64,
+        chan_max=512,
+        **kwargs
+    ):
         super().__init__()
 
         self.scale_factor = scale_factor
@@ -189,8 +216,15 @@ class D(nn.Module):
         self.blocks = nn.ModuleList()
         for b in reversed(range(num_blocks)):
             prev_chan, next_chan = chan(b + 1), chan(b)
-            self.blocks.append(ResStyledBlock(in_chan=prev_chan, out_chan=next_chan, style_size=style_size, seq='CACA',
-                                                last_act=False))
+            self.blocks.append(
+                ResStyledBlock(
+                    in_chan=prev_chan,
+                    out_chan=next_chan,
+                    style_size=style_size,
+                    seq="CACA",
+                    last_act=False,
+                )
+            )
             self.blocks.append(Resampler2(3, 0.5))
 
         self.block9 = nn.Sequential(
@@ -206,7 +240,7 @@ class D(nn.Module):
         # rs = np.float(s)
         # eul_x = lag2eul(lag_x, a=rs)[0]
         # x = torch.cat([eul_x, x], dim=1)
-        
+
         # D start
         x = self.block0((x, s))
 
