@@ -1,6 +1,8 @@
 import math
 import torch
 import torch.nn as nn
+from torch.nn.init import kaiming_normal
+
 from .style import ModulatedConv3d
 from .resample import Resampler
 
@@ -389,3 +391,30 @@ class D(nn.Module):
         x = self.out(x, s)
 
         return x
+
+
+# class CrossChanelMixing(nn.Module):
+#     def __init__(
+#         self,
+#         in_chan,
+#         out_chan,
+#     ):
+#         super().__init__()
+#         self.in_chan = in_chan
+#         self.out_chan = out_chan
+#         self.mix = nn.Conv3d(in_channels=in_chan, out_channels=out_chan, kernel_size=1, stride=1, padding=0,bias=False)
+#         for param in self.mix.parameters():
+#             param.requires_grad = False
+#         nn.init.kaiming_normal_(self.mix.weight, a=0.2)
+#
+#     def forward(self, x, style=None):
+#         # batch_size, channels, height, width, depth = x.shape
+#         x = self.mix(x)
+#         return x
+#
+# class Projector(nn.Module):
+#     def __init__(
+#             self,
+#             in_chan,
+#             out_chan,
+#     )

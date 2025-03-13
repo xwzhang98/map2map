@@ -504,19 +504,19 @@ def train(
                     a=np.float64(style),
                     eul_scale_factor=EUL_SCALE_FACTOR,
                     inv_shuffle=False,
-                )
+                )[0]
                 output_eul = lag2eul(
                     output_disp,
                     a=np.float64(style),
                     eul_scale_factor=EUL_SCALE_FACTOR,
                     inv_shuffle=False,
-                )
+                )[0]
                 tgt_eul = lag2eul(
                     tgt_disp,
                     a=np.float64(style),
                     eul_scale_factor=EUL_SCALE_FACTOR,
                     inv_shuffle=False,
-                )
+                )[0]
             fig = plt_slices(
                 input_disp,
                 output_disp,
