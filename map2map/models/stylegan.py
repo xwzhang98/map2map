@@ -209,6 +209,7 @@ class G(nn.Module):
             kernel_size=1,
             demodulation=True,
         )
+        self.head_act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.style_embed = nn.Sequential(
             nn.Linear(style_size, embedding_size),
@@ -234,6 +235,7 @@ class G(nn.Module):
 
         y = x  # direct from the input without toRGB
         x = self.head(x, s)  # shallow feature extraction
+        x = self.head_act(x)
 
         for block in self.blocks:
             x, y = block(x, y, s)
