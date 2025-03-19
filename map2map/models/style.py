@@ -257,6 +257,12 @@ class ModulatedConv3d(nn.Module):
 
         K3 = (kernel_size,) * 3
         self.weight = nn.Parameter(torch.empty(out_chan, in_chan, *K3))
+        nn.init.kaiming_uniform_(
+            self.weight,
+            a=math.sqrt(5),
+            mode="fan_in",  # effectively 'fan_out' for 'D'
+            nonlinearity="leaky_relu",
+        )
         self.stride = stride
         self.conv = F.conv3d
         self.demodulation = demodulation
@@ -275,7 +281,6 @@ class ModulatedConv3d(nn.Module):
         # x shape N, C, D, H, W
         # style shape N, embedding_size
         s = self.embed_layers(style)  # N, in_chan
-
         eps = 1e-16
 
         batch, _, *DHW_in = x.shape
@@ -290,6 +295,7 @@ class ModulatedConv3d(nn.Module):
         # Modulate weights
         w = w.unsqueeze(0)  # [1OIkkk]
         s = s.unsqueeze(1).unsqueeze(3).unsqueeze(4).unsqueeze(5)  # [N1I111]
+
         w = w * s  # [NOIkkk]
 
         # Demodulate weights

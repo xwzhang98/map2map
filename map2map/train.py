@@ -337,8 +337,9 @@ def train(
         style = style.to(device, non_blocking=True)
 
         output = model(input, style)
-        if batch <= 5 or (i + 1) % 200 == 0 and rank == 0:
+        if i <= 5 or batch % 200 == 0 and rank == 0:
             print("##### batch :", batch)
+            print("##### total batch :", len(loader))
             print("input shape :", input.shape)
             print("output shape :", output.shape)
             print("target shape :", target.shape)
@@ -347,7 +348,7 @@ def train(
         if hasattr(model.module, "scale_factor") and model.module.scale_factor != 1:
             input = resample(input, model.module.scale_factor, narrow=False)
         input, output, target = narrow_cast(input, output, target)
-        if batch <= 5 and rank == 0:
+        if i <= 5 and rank == 0:
             print("narrowed shape :", output.shape, flush=True)
 
         loss = criterion(output, target)
@@ -432,14 +433,14 @@ def train(
             loss /= world_size
             if rank == 0:
                 logger.add_scalar(
-                    "train/batch/loss/generator/l2", loss.detach(), global_step=batch
+                    "batch/loss/generator/l2", loss.detach(), global_step=batch
                 )
                 if args.adv and epoch >= args.adv_start:
                     logger.add_scalar(
-                        "train/batch/loss/adv/G", loss_adv.detach(), global_step=batch
+                        "batch/loss/adv/G", loss_adv.detach(), global_step=batch
                     )
                     logger.add_scalars(
-                        "train/batch/loss/adv/D",
+                        "batch/loss/adv/D",
                         {
                             "total": adv_loss.detach(),
                             "fake": adv_loss_fake.detach(),
@@ -449,31 +450,31 @@ def train(
                     )
 
                 logger.add_scalar(
-                    "train/batch/grad/generator/first", grads[0], global_step=batch
+                    "batch/grad/generator/first", grads[0], global_step=batch
                 )
                 logger.add_scalar(
-                    "train/batch/grad/generator/last", grads[-1], global_step=batch
+                    "batch/grad/generator/last", grads[-1], global_step=batch
                 )
                 if args.adv and epoch >= args.adv_start:
                     logger.add_scalar(
-                        "train/batch/grad/adv/first", adv_grads[0], global_step=batch
+                        "batch/grad/adv/first", adv_grads[0], global_step=batch
                     )
                     logger.add_scalar(
-                        "train/batch/grad/adv/last", adv_grads[-1], global_step=batch
+                        "batch/grad/adv/last", adv_grads[-1], global_step=batch
                     )
 
     dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
         logger.add_scalar(
-            "train/epoch/loss/generator/l2", epoch_loss[0], global_step=epoch + 1
+            "epoch/loss/generator/l2", epoch_loss[0], global_step=epoch + 1
         )
         if args.adv and epoch >= args.adv_start:
             logger.add_scalar(
-                "train/epoch/loss/adv/G", epoch_loss[1], global_step=epoch + 1
+                "epoch/loss/adv/G", epoch_loss[1], global_step=epoch + 1
             )
             logger.add_scalars(
-                "train/epoch/loss/adv/D",
+                "epoch/loss/adv/D",
                 {
                     "total": epoch_loss[2],
                     "fake": epoch_loss[3],
@@ -490,14 +491,14 @@ def train(
         # output: 1,
         try:
             with torch.no_grad():
-                input_disp = input[-1, :3]
-                input_vel = input[-1, 3:6]
+                input_disp = input[-1, :3][None, :]
+                input_vel = input[-1, 3:6][None, :]
 
-                output_disp = output[-1, :3]
-                output_vel = output[-1, 3:6]
+                output_disp = output[-1, :3][None, :]
+                output_vel = output[-1, 3:6][None, :]
 
-                tgt_disp = target[-1, :3]
-                tgt_vel = target[-1, 3:6]
+                tgt_disp = target[-1, :3][None, :]
+                tgt_vel = target[-1, 3:6][None, :]
 
                 input_eul = lag2eul(
                     input_disp,
@@ -518,18 +519,18 @@ def train(
                     inv_shuffle=False,
                 )[0]
             fig = plt_slices(
-                input_disp,
-                output_disp,
-                tgt_disp,
-                output_disp - tgt_disp,
-                input_vel,
-                output_vel,
-                tgt_vel,
-                output_vel - tgt_vel,
-                input_eul,
-                output_eul,
-                tgt_eul,
-                output_eul - tgt_eul,
+                input_disp[-1],
+                output_disp[-1],
+                tgt_disp[-1],
+                output_disp[-1] - tgt_disp[-1],
+                input_vel[-1],
+                output_vel[-1],
+                tgt_vel[-1],
+                output_vel[-1] - tgt_vel[-1],
+                input_eul[-1],
+                output_eul[-1],
+                tgt_eul[-1],
+                output_eul[-1] - tgt_eul[-1],
                 title=[
                     "in disp",
                     "out disp",
@@ -549,7 +550,7 @@ def train(
             logger.add_figure("fig/train", fig, global_step=epoch + 1)
             fig.clf()
         except Exception as error:
-            print(error)
+            print("Error encountered in plotting: ", error)
 
         # fig = plt_power(
         #     input, output, target,

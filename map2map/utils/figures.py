@@ -45,7 +45,7 @@ def score(*fields, labels=None):
     ks = [k.cpu().numpy() for k in ks]
     ps = [P.cpu().numpy() for P in ps]
 
-    if labels[0] is "output" and labels[1] is "target":
+    if labels[0] == "output" and labels[1] == "target":
         return area_under_curve(ks[0], ps[0], ks[1], ps[1])
     else:
         return area_under_curve(ks[1], ps[1], ks[0], ps[0])

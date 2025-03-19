@@ -28,7 +28,7 @@ class HingeLoss(nn.Module):
         return d_loss_real, d_loss_fake
 
 
-def grad_penalty(critic, x, y, lam=10, *args, **kwargs):
+def hinge_grad_penalty(critic, x, y, lam=10, *args, **kwargs):
     """Calculate the gradient penalty for WGAN"""
     device = x.device
     batch_size = x.shape[0]

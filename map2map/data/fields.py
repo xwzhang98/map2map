@@ -230,7 +230,7 @@ class FieldDataset(Dataset):
         if self.style:
             style = np.load(self.style_files[ifile])
             style = torch.from_numpy(style.astype(np.float32))
-        print('field while loading files',style.shape)
+        # print('field while loading files',style.shape)
 
         if self.in_norms is not None:
             for norm, x in zip(self.in_norms, in_fields):

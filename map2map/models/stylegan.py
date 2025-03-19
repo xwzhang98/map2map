@@ -96,7 +96,7 @@ class HBlock(nn.Module):
         out_chan,
         embedding_size,
         inject_noise=True,
-        use_normalize=True,
+        use_normalize=False,
     ):
         super().__init__()
 
@@ -120,7 +120,7 @@ class HBlock(nn.Module):
             kernel_size=3,
             demodulation=True,
         )
-        self.act1 = nn.SiLU(inplace=True)
+        self.act1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.conv2 = ModulatedConv3d(
             in_chan=next_chan,
@@ -129,18 +129,17 @@ class HBlock(nn.Module):
             kernel_size=3,
             demodulation=True,
         )
-        self.act2 = nn.SiLU(inplace=True)
+        self.act2 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-        self.proj = nn.Sequential(
-            ModulatedConv3d(
-                in_chan=next_chan,
-                out_chan=out_chan,
-                embedding_size=embedding_size,
-                kernel_size=1,
-                demodulation=True,
-            ),
-            nn.SiLU(),
-        )
+        self.proj = ModulatedConv3d(
+            in_chan=next_chan,
+            out_chan=out_chan,
+            embedding_size=embedding_size,
+            kernel_size=1,
+            demodulation=False,
+            )
+        
+        self.proj_act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
     def forward(self, x, y, s):
         # left branch:
@@ -166,7 +165,7 @@ class HBlock(nn.Module):
         # right branch
         y = self.upsample(y)
         y = narrow_as(y, x)
-        y = y + self.proj(x, s)
+        y = y + self.proj_act(self.proj(x, s))
         return x, y
 
 
@@ -176,12 +175,12 @@ class G(nn.Module):
         in_chan,
         out_chan,
         style_size,
-        embedding_size,
+        embedding_size=16,
         scale_factor=8,
         chan_base=512,
         chan_min=64,
         chan_max=512,
-        inject_noise=False,
+        inject_noise=True,
         **kwargs
     ):
         super().__init__()
@@ -232,6 +231,7 @@ class G(nn.Module):
 
     def forward(self, x, style):
         s = self.style_embed(style)
+
         y = x  # direct from the input without toRGB
         x = self.head(x, s)  # shallow feature extraction
 
@@ -265,7 +265,7 @@ class ModulatedResidualBlock(nn.Module):
             stride=stride,
             demodulation=True,
         )
-        self.act1 = nn.SiLU(inplace=True)
+        self.act1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.conv2 = ModulatedConv3d(
             in_chan=out_chan,
@@ -275,7 +275,7 @@ class ModulatedResidualBlock(nn.Module):
             stride=stride,
             demodulation=True,
         )
-        self.act2 = nn.SiLU(inplace=True)
+        self.act2 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.skip = ModulatedConv3d(
             in_chan=in_chan,
@@ -294,6 +294,7 @@ class ModulatedResidualBlock(nn.Module):
         x = self.act1(x)
         x = self.conv2(x, style)
         x = self.act2(x)
+        skip = narrow_as(skip, x)
 
         return x + skip
 
@@ -304,7 +305,7 @@ class D(nn.Module):
         in_chan,
         out_chan,
         style_size,
-        embedding_size,
+        embedding_size=16,
         scale_factor=8,
         chan_base=512,
         chan_min=64,
@@ -339,7 +340,7 @@ class D(nn.Module):
             embedding_size=embedding_size,
             kernel_size=1,
         )
-        self.head_act = nn.SiLU(inplace=True)
+        self.head_act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.style_embed = nn.Sequential(
             nn.Linear(style_size, embedding_size),
@@ -367,7 +368,7 @@ class D(nn.Module):
             kernel_size=1,
         )
 
-        self.act1 = nn.SiLU(inplace=True)
+        self.act1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.out = ModulatedConv3d(
             in_chan=chan(-1),
