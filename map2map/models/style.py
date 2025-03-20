@@ -315,3 +315,83 @@ class ModulatedConv3d(nn.Module):
         x = x.view(batch, chan_out, *DHW_out)
 
         return x
+
+
+class ModulatedConv3dBlock(nn.Module):
+    """
+    Convolution layer with and demodulation, from StyleGAN-T.
+
+    """
+
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        embedding_size,
+        kernel_size=3,
+        stride=1,
+        bias=True,
+        demodulation=True,
+    ):
+        super().__init__()
+
+        K3 = (kernel_size,) * 3
+        self.weight = nn.Parameter(torch.empty(out_chan, in_chan, *K3))
+        nn.init.kaiming_uniform_(
+            self.weight,
+            a=math.sqrt(5),
+            mode="fan_in",  # effectively 'fan_out' for 'D'
+            nonlinearity="leaky_relu",
+        )
+        self.stride = stride
+        self.conv = F.conv3d
+        self.demodulation = demodulation
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_chan))
+        else:
+            self.register_parameter("bias", None)
+
+        self.embed_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(embedding_size, in_chan),
+        )
+
+    def forward(self, x, style):
+        # x shape N, C, D, H, W
+        # style shape N, embedding_size
+        s = self.embed_layers(style)  # N, in_chan
+        eps = 1e-16
+
+        batch, _, *DHW_in = x.shape
+        w = self.weight
+        chan_out, chan_in, *K = w.shape
+
+        # Pre-normalize inputs
+        # if self.demodulation:
+        #     w = w * w.square().mean([1, 2, 3, 4], keepdim=True).rsqrt()
+        #     s = s * s.square().mean().rsqrt()
+
+        # Modulate weights
+        if self.demodulation:
+            w = w.unsqueeze(0)  # [1OIkkk]
+            s = s.unsqueeze(1).unsqueeze(3).unsqueeze(4).unsqueeze(5)  # [N1I111]
+            w = w * s  # [NOIkkk]
+
+        # Demodulate weights
+        if self.demodulation:
+            coeff = torch.rsqrt(torch.sum(w.pow(2), dim=[2, 3, 4, 5]) + eps)  # [NO]
+            coeff = (
+                coeff.unsqueeze(2).unsqueeze(3).unsqueeze(4).unsqueeze(5)
+            )  # [NO1111]
+            w = w * coeff  # [NOIkkk]
+
+        w = w.reshape(batch * chan_out, chan_in, *K)
+        x = x.reshape(1, batch * chan_in, *DHW_in)
+        # END HERE
+        x = self.conv(x, w, bias=self.bias, stride=self.stride, groups=batch)
+        _, _, *DHW_out = x.shape
+
+        x = x.view(batch, chan_out, *DHW_out)
+
+        return x

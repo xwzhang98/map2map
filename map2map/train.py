@@ -394,18 +394,18 @@ def train(
             adv_loss = adv_loss_fake + adv_loss_real
             epoch_loss[2] += adv_loss.detach()
 
-            # if args.adv_wgan_gp_interval > 0 and batch % args.adv_wgan_gp_interval == 0:
-            #     adv_loss_reg = wgan_grad_penalty(adv_model, output, target, style=style)
-            #     adv_loss_reg_ = adv_loss_reg * args.adv_wgan_gp_interval
-            #
-            #     adv_loss_reg_.backward()
-            #
-            #     if batch % adv_wgan_gp_log_interval == 0 and rank == 0:
-            #         logger.add_scalar(
-            #             "train/batch/loss/adv/reg",
-            #             adv_loss_reg.detach(),
-            #             global_step=batch,
-            #         )
+            if args.adv_wgan_gp_interval > 0 and batch % args.adv_wgan_gp_interval == 0:
+                adv_loss_reg = wgan_grad_penalty(adv_model, output, target, style=style)
+                adv_loss_reg_ = adv_loss_reg * args.adv_wgan_gp_interval
+
+                adv_loss_reg_.backward()
+
+                if batch % adv_wgan_gp_log_interval == 0 and rank == 0:
+                    logger.add_scalar(
+                        "batch/loss/adv/gradient_penalty",
+                        adv_loss_reg.detach(),
+                        global_step=batch,
+                    )
 
             adv_optimizer.step()
             adv_grads = get_grads(adv_model)

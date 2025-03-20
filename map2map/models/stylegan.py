@@ -56,9 +56,10 @@ class NoiseInjection(nn.Module):
         self.std = nn.Parameter(torch.zeros(1), requires_grad=True)
 
     def forward(self, x, noise=None):
+        batch, channels, height, width, depth = x.size()
         if noise is None:
-            batch, channels, height, width, depth = x.size()
             noise = torch.randn(batch, 1, height, width, depth).to(x.device)
+        std = self.std[None, :, None, None, None]
         return x + self.std * noise
 
 
@@ -153,7 +154,7 @@ class HBlock(nn.Module):
             x = self.normalize1(x)
         x = self.act1(x)
         # ---------------------
-        # block 1
+        # block 2
         # ---------------------
         x = self.conv2(x, s)
         if self.inject_noise:
@@ -241,6 +242,80 @@ class G(nn.Module):
             x, y = block(x, y, s)
 
         return y
+
+class G_T(nn.Module):
+    def __init__(
+        self,
+        in_chan,
+        out_chan,
+        style_size,
+        embedding_size=16,
+        scale_factor=8,
+        chan_base=512,
+        chan_min=64,
+        chan_max=512,
+        inject_noise=True,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.in_chan = in_chan
+        self.out_chan = out_chan
+        self.style_size = style_size
+        self.embedding_size = embedding_size
+        self.scale_factor = scale_factor
+        num_blocks = round(math.log2(self.scale_factor))
+        self.num_blocks = num_blocks
+        self.inject_noise = inject_noise
+
+        assert chan_min <= chan_max
+
+        def chan(b):
+            c = chan_base >> b
+            c = max(c, chan_min)
+            c = min(c, chan_max)
+            return c
+
+        self.head = ModulatedConv3d(
+            in_chan=in_chan,
+            out_chan=chan(0),
+            embedding_size=embedding_size,
+            kernel_size=1,
+            demodulation=True,
+        )
+        self.head_act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        self.style_embed = nn.Sequential(
+            nn.Linear(style_size, embedding_size),
+            nn.SiLU(),
+            nn.Linear(embedding_size, embedding_size),
+        )
+
+        self.blocks = nn.ModuleList()
+        for b in range(num_blocks):
+            prev_chan, next_chan = chan(b), chan(b + 1)
+            self.blocks.append(
+                HBlock(
+                    prev_chan=prev_chan,
+                    next_chan=next_chan,
+                    out_chan=out_chan,
+                    embedding_size=embedding_size,
+                    inject_noise=inject_noise,
+                )
+            )
+
+    def forward(self, x, style):
+        s = self.style_embed(style)
+
+        y = x  # direct from the input without toRGB
+        x = self.head(x, s)  # shallow feature extraction
+        x = self.head_act(x)
+
+        for block in self.blocks:
+            x, y = block(x, y, s)
+
+        return y
+
 
 
 class ModulatedResidualBlock(nn.Module):
