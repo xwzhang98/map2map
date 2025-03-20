@@ -23,8 +23,8 @@ class WDistLoss(nn.Module):
 
     def _forward_D(self, D_fake, D_real):
         # hinge loss
-        d_loss_real = F.relu(1.0 - D_real).mean()
-        d_loss_fake = F.relu(1.0 + D_fake).mean()
+        d_loss_real = -D_real.mean()
+        d_loss_fake = D_fake.mean()
         return d_loss_real, d_loss_fake
 
 
