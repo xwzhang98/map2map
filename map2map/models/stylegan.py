@@ -98,6 +98,7 @@ class HBlock(nn.Module):
         embedding_size,
         inject_noise=True,
         use_normalize=False,
+        use_attention=False,
     ):
         super().__init__()
 
@@ -105,6 +106,7 @@ class HBlock(nn.Module):
         self.inject_noise = inject_noise
         self.upsample = Resampler(ndim=3, scale_factor=2, narrow=True)
         self.use_normalize = use_normalize
+        self.use_attention = use_attention
 
         if self.inject_noise:
             self.noise1 = NoiseInjection()
@@ -122,6 +124,8 @@ class HBlock(nn.Module):
             demodulation=True,
         )
         self.act1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        if use_attention:
+            self.attention = SelfAttention3D(next_chan)
 
         self.conv2 = ModulatedConv3d(
             in_chan=next_chan,
@@ -162,12 +166,42 @@ class HBlock(nn.Module):
         if self.use_normalize:
             x = self.normalize2(x)
         x = self.act2(x)
+        if self.use_attention:
+            x = self.attention(x)
+
         # ---------------------
         # right branch
         y = self.upsample(y)
         y = narrow_as(y, x)
         y = y + self.proj_act(self.proj(x, s))
         return x, y
+
+
+class SelfAttention3D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.query = nn.Conv3d(channels, channels // 8, 1)
+        self.key = nn.Conv3d(channels, channels // 8, 1)
+        self.value = nn.Conv3d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch, c, d, h, w = x.size()
+
+        # Flatten spatial dimensions for attention calculation
+        q = self.query(x).view(batch, -1, d * h * w).permute(0, 2, 1)  # B, DHW, C/8
+        k = self.key(x).view(batch, -1, d * h * w)  # B, C/8, DHW
+        v = self.value(x).view(batch, -1, d * h * w)  # B, C, DHW
+
+        # Calculate attention scores
+        attention = torch.bmm(q, k)  # B, DHW, DHW
+        attention = torch.softmax(attention, dim=2)
+
+        # Apply attention to values
+        out = torch.bmm(v, attention.permute(0, 2, 1))  # B, C, DHW
+        out = out.view(batch, c, d, h, w)
+
+        return self.gamma * out + x  # Residual connection with learnable weight
 
 
 class G(nn.Module):
@@ -182,6 +216,7 @@ class G(nn.Module):
         chan_min=64,
         chan_max=512,
         inject_noise=True,
+        use_attention=False,
         **kwargs
     ):
         super().__init__()
@@ -213,14 +248,23 @@ class G(nn.Module):
         self.head_act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.style_embed = nn.Sequential(
-            nn.Linear(style_size, embedding_size),
-            nn.SiLU(),
-            nn.Linear(embedding_size, embedding_size),
+            nn.Linear(style_size, embedding_size * 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(embedding_size * 2, embedding_size * 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(embedding_size * 2, embedding_size),
         )
 
         self.blocks = nn.ModuleList()
         for b in range(num_blocks):
             prev_chan, next_chan = chan(b), chan(b + 1)
+            use_attn_in_this_block = False
+            if use_attention:
+                if num_blocks <= 3 and b == 1:  # Middle block for small networks
+                    use_attn_in_this_block = True
+                elif num_blocks > 3 and (b == 1 or b == 2):  # Middle blocks for larger networks
+                    use_attn_in_this_block = True
+
             self.blocks.append(
                 HBlock(
                     prev_chan=prev_chan,
@@ -228,6 +272,7 @@ class G(nn.Module):
                     out_chan=out_chan,
                     embedding_size=embedding_size,
                     inject_noise=inject_noise,
+                    use_attention=use_attn_in_this_block  # Pass the flag
                 )
             )
 
