@@ -46,19 +46,25 @@ def node_worker(args):
 
 
 def gpu_worker(local_rank, node, args):
+    print("local_rank", local_rank)
+    print("node", node)
+    print("args.gpus_per_node", args.gpus_per_node)
+    print("device_count", torch.cuda.device_count())
+    print("args.world_size", args.world_size)
+    
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
-    device = torch.device("cuda", 0)
-
+    # Don't set CUDA_VISIBLE_DEVICES
+    
+    # Create the device with the appropriate local_rank
+    device = torch.device('cuda', local_rank)
+    
+    # Set current device
+    torch.cuda.set_device(local_rank)
+    
     rank = args.gpus_per_node * node + local_rank
-
-    # Need randomness across processes, for sampler, augmentation, noise etc.
-    # Note DDP broadcasts initial model states from rank 0
     torch.manual_seed(args.seed + rank)
-    # good practice to disable cudnn.benchmark if enabling cudnn.deterministic
-    # torch.backends.cudnn.deterministic = True
-
-    dist_init(rank, args)
+    
+    dist_init(rank, args, local_rank)
 
     train_dataset = FieldDataset(
         in_patterns=args.train_in_patterns,
@@ -376,7 +382,7 @@ def train(
             if args.cgan:
                 output = torch.cat([input, output], dim=1)
                 target = torch.cat([input, target], dim=1)
-                # the output and target array is now [input, eul_out/eul_tgt, output/target]
+                # the output and target array is now [input, output/target, eul_out/eul_tgt]
 
             set_requires_grad(adv_model, True)
 
@@ -573,38 +579,85 @@ def train(
     return epoch_loss
 
 
-def dist_init(rank, args):
-    dist_file = "dist_addr"
 
+def dist_init(rank, args, local_rank):
+    dist_file = "dist_addr"
+    
+    print(f"Rank {rank}: Setting up distributed training with local_rank {local_rank}")
+    
     if rank == 0:
         addr = socket.gethostname()
-
         with socket.socket() as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((addr, 0))
             _, port = s.getsockname()
-
+        
         args.dist_addr = "tcp://{}:{}".format(addr, port)
-
+        print(f"Rank {rank}: Master node using address {args.dist_addr}")
+        
         with open(dist_file, mode="w") as f:
             f.write(args.dist_addr)
     else:
+        timeout_count = 0
         while not os.path.exists(dist_file):
             time.sleep(1)
-
+            timeout_count += 1
+            if timeout_count > 60:  # 1 minute timeout
+                raise TimeoutError(f"Rank {rank}: Timed out waiting for dist_file")
+        
         with open(dist_file, mode="r") as f:
             args.dist_addr = f.read()
-
+        print(f"Rank {rank}: Using address {args.dist_addr} from master")
+    
+    print(f"Rank {rank}: Initializing process group")
     dist.init_process_group(
         backend=args.dist_backend,
         init_method=args.dist_addr,
         world_size=args.world_size,
         rank=rank,
     )
-    dist.barrier()
-
+    
+    print(f"Rank {rank}: Waiting at barrier with device_ids=[{local_rank}]")
+    dist.barrier(device_ids=[local_rank])
+    print(f"Rank {rank}: Passed barrier")
+    
     if rank == 0:
         os.remove(dist_file)
+
+# def dist_init(rank, args, local_rank):
+#     dist_file = "dist_addr"
+    
+
+#     if rank == 0:
+#         addr = socket.gethostname()
+
+#         with socket.socket() as s:
+#             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+#             s.bind((addr, 0))
+#             _, port = s.getsockname()
+
+#         args.dist_addr = "tcp://{}:{}".format(addr, port)
+
+#         with open(dist_file, mode="w") as f:
+#             f.write(args.dist_addr)
+#     else:
+#         while not os.path.exists(dist_file):
+#             time.sleep(1)
+
+#         with open(dist_file, mode="r") as f:
+#             args.dist_addr = f.read()
+
+#     dist.init_process_group(
+#         backend=args.dist_backend,
+#         init_method=args.dist_addr,
+#         world_size=args.world_size,
+#         rank=rank,
+#         # device_id=local_rank  # Add this line to specify the device ID
+#     )
+#     dist.barrier(device_ids=[local_rank])
+
+#     if rank == 0:
+#         os.remove(dist_file)
 
 
 def init_weights(m):

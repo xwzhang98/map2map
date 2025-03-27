@@ -47,12 +47,12 @@ class G(nn.Module):
             c = min(c, chan_max)
             return c
 
-        self.in_layer = nn.ModuleList(
-            [
-                ConvStyled3d(in_chan, chan(0), self.style_size, kernal_size=1),
-                LeakyReLUStyled(0.2, inplace=True),
-            ]
-        )
+        # self.in_layer = nn.ModuleList(
+        #     [
+        #         ConvStyled3d(in_chan, chan(0), self.style_size, kernal_size=1),
+        #         LeakyReLUStyled(0.2, inplace=True),
+        #     ]
+        # )
         self.block0 = nn.Sequential(
             ConvStyled3d(in_chan, chan(0), self.style_size, 1),
             LeakyReLUStyled(0.2, True),

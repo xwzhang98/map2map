@@ -137,7 +137,7 @@ class HBlock(nn.Module):
             out_chan=out_chan,
             embedding_size=embedding_size,
             kernel_size=1,
-            demodulation=False,
+            demodulation=True,
             )
         
         self.proj_act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
