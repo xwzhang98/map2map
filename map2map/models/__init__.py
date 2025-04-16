@@ -11,7 +11,7 @@ from .power import power
 from .dice import DiceLoss, dice_loss
 
 from .wasserstein import WDistLoss, wasserstein_distance_loss, wgan_grad_penalty
-from .hinge_loss import HingeLoss, hinge_grad_penalty
+from .hinge_loss import HingeLoss, hinge_grad_penalty, r1_regularization
 from .adversary import grad_penalty_reg
 from .spectral_norm import add_spectral_norm, rm_spectral_norm
 from .instance_noise import InstanceNoise

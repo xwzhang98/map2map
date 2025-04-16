@@ -6,9 +6,19 @@ from torch.nn.init import kaiming_normal
 from .style import ModulatedConv3d
 from .resample import Resampler
 
-
 def normalization(channels):
-    return nn.GroupNorm(num_groups=32, num_channels=channels, eps=1e-16, affine=True)
+    # For channels <= 32, use GroupNorm with channels/4 groups
+    # This ensures each group has at least 4 channels
+    if channels <= 32:
+        num_groups = max(1, channels // 4)
+    else:
+        num_groups = 32
+    
+    return nn.GroupNorm(num_groups=num_groups, num_channels=channels, eps=1e-5, affine=True)
+
+
+# def normalization(channels):
+#     return nn.GroupNorm(num_groups=32, num_channels=channels, eps=1e-16, affine=True)
 
 
 def zero_module(module):
@@ -58,10 +68,11 @@ class NoiseInjection(nn.Module):
     def forward(self, x, noise=None):
         batch, channels, height, width, depth = x.size()
         if noise is None:
-            noise = torch.randn(batch, 1, height, width, depth).to(x.device)
-        std = self.std[None, :, None, None, None]
-        return x + self.std * noise
-
+            noise = torch.randn_like(x[:, :1]).to(x.device)
+        std_shape = (-1,) + (1,) * (x.dim() - 2)
+        noise = self.std.view(std_shape) * noise
+        return x + noise
+ 
 
 class HBlock(nn.Module):
     """The "H" block of the StyleGAN2 generator.
@@ -99,6 +110,7 @@ class HBlock(nn.Module):
         inject_noise=True,
         use_normalize=False,
         use_attention=False,
+        which_attention="linear",
     ):
         super().__init__()
 
@@ -125,7 +137,10 @@ class HBlock(nn.Module):
         )
         self.act1 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
         if use_attention:
-            self.attention = SelfAttention3D(next_chan)
+            if which_attention == "self":
+                self.attention = SelfAttention3D(next_chan)
+            elif which_attention == "linear":
+                self.attention = LinearAttention3D(next_chan)
 
         self.conv2 = ModulatedConv3d(
             in_chan=next_chan,
@@ -202,6 +217,37 @@ class SelfAttention3D(nn.Module):
         out = out.view(batch, c, d, h, w)
 
         return self.gamma * out + x  # Residual connection with learnable weight
+    
+    
+class LinearAttention3D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.query = nn.Conv3d(channels, channels//8, 1)
+        self.key = nn.Conv3d(channels, channels//8, 1)
+        self.value = nn.Conv3d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+        
+    def forward(self, x):
+        batch, c, d, h, w = x.size()
+        
+        # Generate feature maps
+        q = self.query(x)    # B, C/8, D, H, W
+        k = self.key(x)      # B, C/8, D, H, W
+        v = self.value(x)    # B, C, D, H, W
+        
+        # Apply softmax along channel dimension
+        q = q.view(batch, -1, d*h*w)           # B, C/8, DHW
+        k = self.softmax(k.view(batch, -1, d*h*w))  # B, C/8, DHW
+        v = v.view(batch, -1, d*h*w)           # B, C, DHW
+        
+        # Linear attention computation (avoid explicit DHW×DHW matrix)
+        context = torch.bmm(v, k.transpose(1, 2))   # B, C, C/8
+        attention = torch.bmm(context, q)           # B, C, DHW
+        
+        # Reshape and combine with input
+        attention = attention.view(batch, c, d, h, w)
+        return x + self.gamma * attention
 
 
 class G(nn.Module):
@@ -216,7 +262,8 @@ class G(nn.Module):
         chan_min=64,
         chan_max=512,
         inject_noise=True,
-        use_attention=False,
+        use_normalize=False,
+        use_attention=True,
         **kwargs
     ):
         super().__init__()
@@ -229,7 +276,7 @@ class G(nn.Module):
         num_blocks = round(math.log2(self.scale_factor))
         self.num_blocks = num_blocks
         self.inject_noise = inject_noise
-
+        self.use_normalize = use_normalize
         assert chan_min <= chan_max
 
         def chan(b):
@@ -272,7 +319,8 @@ class G(nn.Module):
                     out_chan=out_chan,
                     embedding_size=embedding_size,
                     inject_noise=inject_noise,
-                    use_attention=use_attn_in_this_block  # Pass the flag
+                    use_normalize=use_normalize,
+                    use_attention=use_attn_in_this_block
                 )
             )
 
@@ -371,6 +419,7 @@ class ModulatedResidualBlock(nn.Module):
         embedding_size,
         kernel_size=3,
         stride=1,
+        use_normalize=False,
     ):
         super().__init__()
         self.in_chan = in_chan
@@ -378,6 +427,11 @@ class ModulatedResidualBlock(nn.Module):
         self.embedding_size = embedding_size
         self.kernel_size = kernel_size
         self.stride = stride
+        self.use_normalize = use_normalize
+        
+        if self.use_normalize:
+            self.normalize1 = normalization(out_chan)
+            self.normalize2 = normalization(out_chan)
 
         self.conv1 = ModulatedConv3d(
             in_chan=in_chan,
@@ -398,6 +452,8 @@ class ModulatedResidualBlock(nn.Module):
             demodulation=True,
         )
         self.act2 = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        
+        self.layer_scale = nn.Parameter(torch.ones(1) * 1e-5, requires_grad=True)
 
         self.skip = ModulatedConv3d(
             in_chan=in_chan,
@@ -413,9 +469,14 @@ class ModulatedResidualBlock(nn.Module):
         skip = self.skip(x, style)
         # main branch
         x = self.conv1(x, style)
+        if self.use_normalize:
+            x = self.normalize1(x)
         x = self.act1(x)
         x = self.conv2(x, style)
+        if self.use_normalize:
+            x = self.normalize2(x)
         x = self.act2(x)
+        x = x * self.layer_scale
         skip = narrow_as(skip, x)
 
         return x + skip
@@ -432,6 +493,7 @@ class D(nn.Module):
         chan_base=512,
         chan_min=64,
         chan_max=512,
+        use_normalize=True,
         **kwargs
     ):
         super().__init__()
@@ -443,7 +505,7 @@ class D(nn.Module):
         num_blocks = round(math.log2(self.scale_factor))
         self.num_blocks = num_blocks
         self.embedding_size = embedding_size
-
+        self.use_normalize = use_normalize
         assert chan_min <= chan_max
 
         def chan(b):
@@ -480,6 +542,7 @@ class D(nn.Module):
                     in_chan=prev_chan,
                     out_chan=next_chan,
                     embedding_size=embedding_size,
+                    use_normalize=use_normalize,
                 )
             )
 

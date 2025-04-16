@@ -21,6 +21,7 @@ from .models import (
     resample,
     lag2eul,
     wgan_grad_penalty,
+    r1_regularization,
 )
 from .utils import import_attr, load_model_state_dict, plt_slices, plt_power
 
@@ -401,7 +402,8 @@ def train(
             epoch_loss[2] += adv_loss.detach()
 
             if args.adv_wgan_gp_interval > 0 and batch % args.adv_wgan_gp_interval == 0:
-                adv_loss_reg = wgan_grad_penalty(adv_model, output, target, style=style)
+                # adv_loss_reg = wgan_grad_penalty(adv_model, output, target, style=style)
+                adv_loss_reg = r1_regularization(adv_model, target, style=style)
                 adv_loss_reg_ = adv_loss_reg * args.adv_wgan_gp_interval
 
                 adv_loss_reg_.backward()

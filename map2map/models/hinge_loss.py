@@ -23,6 +23,8 @@ class HingeLoss(nn.Module):
 
     def _forward_D(self, D_fake, D_real):
         # hinge loss
+        # d_loss_fake = F.relu(1.0 + D_fake).mean(dim=[0, 1])
+        # d_loss_real = F.relu(1.0 - D_real).mean(dim=[0, 1])
         d_loss_fake = F.relu(1.0 + D_fake).mean()
         d_loss_real = F.relu(1.0 - D_real).mean()
         return d_loss_real, d_loss_fake
@@ -58,3 +60,35 @@ def hinge_grad_penalty(critic, x, y, lam=10, *args, **kwargs):
     )
 
     return penalty
+
+
+def r1_regularization(critic, real_data, style=None, lam=10.0):
+    """R1 regularization for StyleGAN2.
+    
+    This penalizes the gradient norm at real data points only.
+    """
+    real_data = real_data.detach().requires_grad_(True)
+    
+    if style is not None:
+        real_pred = critic(real_data, style)
+    else:
+        real_pred = critic(real_data)
+    
+    # Average over spatial dimensions if present
+    real_pred = real_pred.flatten(start_dim=1).mean(dim=1).sum()
+    
+    grad_real = torch.autograd.grad(
+        outputs=real_pred,
+        inputs=real_data,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    
+    # Compute R1 gradient penalty
+    r1_penalty = lam * 0.5 * (grad_real.flatten(start_dim=1).square().sum(1)).mean()
+    
+    # DDP hack from your original implementation
+    r1_penalty = r1_penalty + 0 * real_pred
+    
+    return r1_penalty
