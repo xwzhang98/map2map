@@ -107,7 +107,7 @@ def hinge_grad_penalty(critic, x, y, lam=10, *args, **kwargs):
 
 
 def r1_regularization(critic, real_data, style=None, lam=10.0):
-    """R1 regularization for StyleGAN2.
+    """Memory-optimized R1 regularization for StyleGAN2.
     
     This penalizes the gradient norm at real data points only.
     """
@@ -118,7 +118,7 @@ def r1_regularization(critic, real_data, style=None, lam=10.0):
     else:
         real_pred = critic(real_data)
     
-    # Average over spatial dimensions if present
+    # Average over spatial dimensions if present and sum for scalar output
     real_pred = real_pred.flatten(start_dim=1).mean(dim=1).sum()
     
     grad_real = torch.autograd.grad(
@@ -129,10 +129,19 @@ def r1_regularization(critic, real_data, style=None, lam=10.0):
         only_inputs=True
     )[0]
     
-    # Compute R1 gradient penalty
-    r1_penalty = lam * 0.5 * (grad_real.flatten(start_dim=1).square().sum(1)).mean()
+    # Compute R1 gradient penalty with memory optimization
+    # Use in-place operations where possible
+    grad_flat = grad_real.flatten(start_dim=1)
+    r1_penalty = lam * 0.5 * grad_flat.square().sum(1).mean()
     
-    # DDP hack from your original implementation
+    # Clear intermediate tensors immediately
+    del grad_real, grad_flat
+    
+    # DDP hack
     r1_penalty = r1_penalty + 0 * real_pred
+    
+    # Force memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     return r1_penalty

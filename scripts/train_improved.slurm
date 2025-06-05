@@ -36,13 +36,13 @@ srun python $code_root_dir/map2map/m2m.py train \
     --train-tgt-patterns "$data_root_dir/$tgt_dir/$train_dirs/disp.npy","$data_root_dir/$tgt_dir/$train_dirs/vel.npy" \
     --train-style-pattern "$data_root_dir/$in_dir/$train_dirs/style.npy" \
     --in-norms cosmology.dis,cosmology.vel --tgt-norms cosmology.dis,cosmology.vel \
-    --augment --aug-shift 28 \
-    --crop 28 --crop-step 28 --pad 3 --scale-factor 2 --previous-scale-factor 0 --target-meshsize 512 \
+    --augment --aug-shift 32 \
+    --crop 32 --crop-step 32 --pad 3 --scale-factor 2 --previous-scale-factor 0 --target-meshsize 512 \
     --model stylegan.G --adv-model stylegan.D --adv-criterion HingeLoss --cgan --callback-at . \
     --adv-start 5 --adv-wgan-gp-interval 16 \
     --lr 2e-4 --adv-lr 2e-4 --optimizer Adam --optimizer-args '{"betas": [0.0, 0.99]}' \
     --batch-size 1 --loader-workers 2 --load-state checkpoint.pt \
-    --epochs 100 --progressive-fade-epochs 50 \
+    --epochs 100 --progressive-fade-epochs 50 --log-interval 50 \
     --misc-kwargs '{"use_pixel_shuffle": true, "use_normalize": true}' \
 
 date

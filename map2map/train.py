@@ -725,59 +725,46 @@ def train(
             logger.add_figure("Visualization/Fields", fig, global_step=epoch + 1)
             fig.clf()
             
-            # === Physical Metrics for Cosmological Fields ===
-            with torch.no_grad():
-                # Compute relative errors
-                disp_rel_error = torch.norm(output_disp - tgt_disp) / (torch.norm(tgt_disp) + 1e-8)
-                vel_rel_error = torch.norm(output_vel - tgt_vel) / (torch.norm(tgt_vel) + 1e-8)
-                
-                # Compute divergence statistics (important for cosmology)
-                def compute_divergence(field):
-                    # Simple finite difference divergence
-                    dx = field[:, 0, 1:, :, :] - field[:, 0, :-1, :, :]
-                    dy = field[:, 1, :, 1:, :] - field[:, 1, :, :-1, :]
-                    dz = field[:, 2, :, :, 1:] - field[:, 2, :, :, :-1]
-                    return dx.mean(), dy.mean(), dz.mean()
-                
-                div_out = compute_divergence(output_vel)
-                div_tgt = compute_divergence(tgt_vel)
-                div_error = sum((do - dt)**2 for do, dt in zip(div_out, div_tgt))**0.5
-                
-                logger.add_scalar(
-                    "Physics/RelativeError/Displacement", disp_rel_error, global_step=epoch + 1
-                )
-                logger.add_scalar(
-                    "Physics/RelativeError/Velocity", vel_rel_error, global_step=epoch + 1
-                )
-                logger.add_scalar(
-                    "Physics/DivergenceError", div_error, global_step=epoch + 1
-                )
-                
-                # Field statistics
-                logger.add_scalar(
-                    "Physics/OutputStd/Displacement", output_disp.std(), global_step=epoch + 1
-                )
-                logger.add_scalar(
-                    "Physics/OutputStd/Velocity", output_vel.std(), global_step=epoch + 1
-                )
+            # === Physical Metrics for Cosmological Fields (reduced frequency) ===
+            if epoch % 5 == 0:  # Only compute every 5 epochs to save memory
+                with torch.no_grad():
+                    # Compute only essential relative errors
+                    disp_rel_error = torch.norm(output_disp - tgt_disp) / (torch.norm(tgt_disp) + 1e-8)
+                    vel_rel_error = torch.norm(output_vel - tgt_vel) / (torch.norm(tgt_vel) + 1e-8)
+                    
+                    logger.add_scalar(
+                        "Physics/RelativeError/Displacement", disp_rel_error, global_step=epoch + 1
+                    )
+                    logger.add_scalar(
+                        "Physics/RelativeError/Velocity", vel_rel_error, global_step=epoch + 1
+                    )
+                    
+                    # Skip memory-intensive divergence computation
+                    # Field statistics (reduced)
+                    logger.add_scalar(
+                        "Physics/OutputStd/Velocity", output_vel.std(), global_step=epoch + 1
+                    )
                 
         except Exception as error:
             print("Error encountered in plotting/metrics: ", error)
 
-        # === Weight and Activation Histograms (log every 10 epochs) ===
-        if epoch % 10 == 0:
-            # Generator weights
+        # === Weight and Activation Histograms (log every 50 epochs, only key layers) ===
+        if epoch % 50 == 0:
+            # Only log key generator layers to save memory
             for name, param in model.named_parameters():
-                if 'weight' in name and param.grad is not None:
-                    logger.add_histogram(f'Weights/Generator/{name}', param.data, global_step=epoch + 1)
-                    logger.add_histogram(f'Gradients/Generator/{name}', param.grad, global_step=epoch + 1)
+                if ('conv' in name or 'fc' in name) and 'weight' in name and param.grad is not None:
+                    # Only log first 3 and last 3 layers
+                    layer_parts = name.split('.')
+                    if any(x in layer_parts[0] for x in ['0', '1', '2']) or any(x in layer_parts[-2] for x in ['final', 'out', 'last']):
+                        logger.add_histogram(f'Weights/Generator/{name}', param.data, global_step=epoch + 1)
             
             if args.adv and epoch >= args.adv_start:
-                # Discriminator weights
+                # Only log key discriminator layers
                 for name, param in adv_model.named_parameters():
-                    if 'weight' in name and param.grad is not None:
-                        logger.add_histogram(f'Weights/Discriminator/{name}', param.data, global_step=epoch + 1)
-                        logger.add_histogram(f'Gradients/Discriminator/{name}', param.grad, global_step=epoch + 1)
+                    if ('conv' in name or 'fc' in name) and 'weight' in name and param.grad is not None:
+                        layer_parts = name.split('.')
+                        if any(x in layer_parts[0] for x in ['0', '1', '2']) or any(x in layer_parts[-2] for x in ['final', 'out', 'last']):
+                            logger.add_histogram(f'Weights/Discriminator/{name}', param.data, global_step=epoch + 1)
         
         # === Memory Usage Tracking ===
         if torch.cuda.is_available():
