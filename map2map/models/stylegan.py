@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.init import kaiming_normal
 
 from .style import ModulatedConv3d
@@ -569,10 +570,12 @@ class D(nn.Module):
         style_size,
         embedding_size=16,
         scale_factor=8,
+        previous_scale_factor=2,
         chan_base=512,
         chan_min=64,
         chan_max=512,
         use_normalize=False,
+        progressive_alpha=1.0,
         **kwargs
     ):
         super().__init__()
@@ -580,13 +583,15 @@ class D(nn.Module):
         self.in_chan = in_chan
         self.out_chan = out_chan
         self.style_size = style_size
-        # self.scale_factor = scale_factor
-        self.scale_factor = 8 # WARNING: hardcoded for fixed discriminator architecture
+        self.scale_factor = scale_factor
+        self.previous_scale_factor = previous_scale_factor
         num_blocks = round(math.log2(self.scale_factor))
         self.num_blocks = num_blocks
         self.embedding_size = embedding_size
         self.use_normalize = use_normalize
+        self.progressive_alpha = progressive_alpha
         assert chan_min <= chan_max
+        
         def chan(b):
             if b >= 0:
                 c = chan_base >> b
@@ -596,9 +601,15 @@ class D(nn.Module):
             c = min(c, chan_max)
             return c
 
+        # Progressive input handling - adjust input channels based on scale
+        # For scale_factor=2: expect 6+8=14 channels (disp+vel+eul)
+        # For scale_factor=4: expect 6+8=14 channels  
+        # For scale_factor=8: expect 6+8=14 channels
+        expected_eul_chan = 8  # This comes from lag2eul conversion
+        self.expected_input_chan = in_chan + expected_eul_chan
+
         self.head = ModulatedConv3d(
-            in_chan=in_chan
-            + 8,  # FIXME here I hard coded the in_chan+8 to meet the dimension after eul_scale_factor 2
+            in_chan=self.expected_input_chan,
             out_chan=chan(num_blocks),
             embedding_size=embedding_size,
             kernel_size=1,
@@ -640,6 +651,18 @@ class D(nn.Module):
             embedding_size=embedding_size,
             kernel_size=1,
         )
+        
+        # Freeze previous scale blocks for progressive training
+        if previous_scale_factor > 0:
+            prev_num_blocks = round(math.log2(previous_scale_factor))
+            print(f"Discriminator: Freezing {prev_num_blocks} blocks for progressive training")
+            # Freeze the LATER blocks (higher resolution processing blocks)
+            # In discriminator, later blocks process higher resolution
+            blocks_to_freeze = num_blocks - prev_num_blocks
+            for b in range(blocks_to_freeze, num_blocks):
+                if b < len(self.blocks):
+                    for param in self.blocks[b].parameters():
+                        param.requires_grad = False
 
     def forward(self, x, style):
         s = self.style_embed(style)
@@ -647,9 +670,33 @@ class D(nn.Module):
         x = self.head(x, s)
         x = self.head_act(x)
 
-        for block in self.blocks:
-            x = block(x, s)
+        # Progressive training with alpha blending
+        if self.progressive_alpha < 1.0 and self.num_blocks > 1:
+            # Process through early blocks (low resolution)
+            for i, block in enumerate(self.blocks[:-1]):
+                x = block(x, s)
+                x = self.downsample(x)
+            
+            # Save pre-final output for blending
+            x_prev = x
+            
+            # Process through final block
+            x = self.blocks[-1](x, s)
             x = self.downsample(x)
+            
+            # Blend between previous resolution and current
+            # For discriminator, we need to downsample the previous output
+            x_prev_downsampled = F.avg_pool3d(x_prev, kernel_size=2, stride=2)
+            if x_prev_downsampled.shape != x.shape:
+                # Pad or crop to match
+                x_prev_downsampled = narrow_as(x_prev_downsampled, x)
+            
+            x = self.progressive_alpha * x + (1 - self.progressive_alpha) * x_prev_downsampled
+        else:
+            # Normal forward pass
+            for block in self.blocks:
+                x = block(x, s)
+                x = self.downsample(x)
 
         x = self.conv1(x, s)
         x = self.act1(x)

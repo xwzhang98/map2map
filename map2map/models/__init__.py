@@ -1,6 +1,7 @@
 from .unet import UNet
 from .vnet import VNet
 from .patchgan import PatchGAN, PatchGAN42
+from .controlnet import ControlNet, MultiScaleControlNet
 
 from .narrow import narrow_by, narrow_cast, narrow_like
 from .resample import resample, Resampler

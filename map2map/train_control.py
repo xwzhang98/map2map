@@ -24,6 +24,8 @@ from .models import (
     wgan_grad_penalty,
     hinge_grad_penalty,
     r1_regularization,
+    ControlNet,
+    MultiScaleControlNet,
 )
 from .utils import import_attr, load_model_state_dict, plt_slices, plt_power
 
@@ -57,12 +59,8 @@ def gpu_worker(local_rank, node, args):
     print("gpu name", torch.cuda.get_device_name(local_rank))
     
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    # Don't set CUDA_VISIBLE_DEVICES
     
-    # Create the device with the appropriate local_rank
     device = torch.device('cuda', local_rank)
-    
-    # Set current device
     torch.cuda.set_device(local_rank)
     
     rank = args.gpus_per_node * node + local_rank
@@ -70,6 +68,7 @@ def gpu_worker(local_rank, node, args):
     
     dist_init(rank, args, local_rank)
 
+    # Create dataset with control inputs
     train_dataset = FieldDataset(
         in_patterns=args.train_in_patterns,
         tgt_patterns=args.train_tgt_patterns,
@@ -111,20 +110,48 @@ def gpu_worker(local_rank, node, args):
     args.out_chan = train_dataset.tgt_chan
     args.style_size = train_dataset.style_size
 
-    model = import_attr(args.model, models, callback_at=args.callback_at)
-
-    # Calculate progressive alpha based on epochs if not provided
-    if 'progressive_alpha' not in args.misc_kwargs and hasattr(args, 'progressive_fade_epochs'):
-        args.misc_kwargs['progressive_alpha'] = 0.0  # Will be updated in training loop
-    
-    model = model(
+    # Load pretrained generator
+    base_generator = import_attr(args.base_model, models, callback_at=args.callback_at)
+    base_generator = base_generator(
         sum(args.in_chan),
         sum(args.out_chan),
         style_size=args.style_size,
         scale_factor=args.scale_factor,
-        previous_scale_factor=args.previous_scale_factor,
         **args.misc_kwargs,
     )
+
+    # Load pretrained generator weights if specified
+    if hasattr(args, 'pretrained_generator_path') and args.pretrained_generator_path:
+        if rank == 0:
+            print(f"Loading pretrained generator from {args.pretrained_generator_path}")
+        pretrained_state = torch.load(args.pretrained_generator_path, map_location=device)
+        if 'model' in pretrained_state:
+            load_model_state_dict(base_generator, pretrained_state['model'], strict=True)
+        else:
+            load_model_state_dict(base_generator, pretrained_state, strict=True)
+
+    # Create ControlNet wrapper
+    if hasattr(args, 'multi_scale_control') and args.multi_scale_control:
+        # Multi-scale control with multiple control inputs
+        control_channels_list = getattr(args, 'control_channels_list', [3, 3])  # Default: 2 control inputs of 3 channels each
+        model = MultiScaleControlNet(
+            generator=base_generator,
+            control_channels_list=control_channels_list,
+            control_scale_factors=getattr(args, 'control_scale_factors', None),
+            use_normalize=getattr(args, 'control_normalize', False),
+            freeze_generator=getattr(args, 'freeze_generator', True),
+        )
+    else:
+        # Single control input
+        control_in_chan = getattr(args, 'control_in_chan', 3)  # Default: 3 channels (e.g., density field)
+        model = ControlNet(
+            generator=base_generator,
+            control_in_chan=control_in_chan,
+            control_scale_factor=getattr(args, 'control_scale_factor', None),
+            use_normalize=getattr(args, 'control_normalize', False),
+            freeze_generator=getattr(args, 'freeze_generator', True),
+        )
+
     model.to(device)
     model = DistributedDataParallel(
         model, device_ids=[device], process_group=dist.new_group()
@@ -134,9 +161,25 @@ def gpu_worker(local_rank, node, args):
     criterion = criterion()
     criterion.to(device)
 
+    # Only train ControlNet parameters if generator is frozen
+    if getattr(args, 'freeze_generator', True):
+        # Get parameters excluding the frozen generator
+        trainable_params = []
+        for name, param in model.named_parameters():
+            if 'generator' not in name or not param.requires_grad:
+                if param.requires_grad:
+                    trainable_params.append(param)
+        if rank == 0:
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params_count = sum(p.numel() for p in trainable_params)
+            print(f"Total parameters: {total_params:,}")
+            print(f"Trainable parameters: {trainable_params_count:,}")
+    else:
+        trainable_params = model.parameters()
+
     optimizer = import_attr(args.optimizer, optim, callback_at=args.callback_at)
     optimizer = optimizer(
-        model.parameters(),
+        trainable_params,
         lr=args.lr,
         **args.optimizer_args,
     )
@@ -151,7 +194,6 @@ def gpu_worker(local_rank, node, args):
             1,
             style_size=args.style_size,
             scale_factor=args.scale_factor,
-            previous_scale_factor=args.previous_scale_factor,
             **args.misc_kwargs,
         )
         adv_model.to(device)
@@ -182,12 +224,6 @@ def gpu_worker(local_rank, node, args):
         and not os.path.isfile(ckpt_link)
         or not args.load_state
     ):
-        if args.init_weight_std is not None:
-            model.apply(init_weights)
-
-            if args.adv:
-                adv_model.apply(init_weights)
-
         start_epoch = 0
 
         if rank == 0:
@@ -217,12 +253,12 @@ def gpu_worker(local_rank, node, args):
             if "adv_scheduler" in state:
                 adv_scheduler.load_state_dict(state["adv_scheduler"])
 
-        torch.set_rng_state(state["rng"].cpu())  # move rng state back
+        torch.set_rng_state(state["rng"].cpu())
 
         if rank == 0:
             min_loss = state["min_loss"]
             if args.adv and "adv_model" not in state:
-                min_loss = None  # restarting with adversary wipes the record
+                min_loss = None
 
             print(
                 "state at epoch {} loaded from {}".format(
@@ -249,18 +285,13 @@ def gpu_worker(local_rank, node, args):
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
-        
-        # Update progressive alpha if using progressive training
-        if hasattr(args, 'progressive_fade_epochs') and args.progressive_fade_epochs > 0:
-            alpha = min(1.0, epoch / args.progressive_fade_epochs)
-            if hasattr(model.module, 'progressive_alpha'):
-                model.module.progressive_alpha = alpha
-            if args.adv and hasattr(adv_model.module, 'progressive_alpha'):
-                adv_model.module.progressive_alpha = alpha
+
+        # Control strength scheduling
+        if hasattr(args, 'control_strength_schedule') and args.control_strength_schedule:
+            control_strength = min(1.0, epoch / getattr(args, 'control_warmup_epochs', 100))
+            model.module.set_control_strength(control_strength)
             if rank == 0 and epoch % 10 == 0:
-                print(f"Progressive alpha: {alpha:.3f}")
-        # if epoch % 10 == 0 or epoch == 0:
-        #     torch.cuda.memory._record_memory_history()
+                print(f"Control strength: {control_strength:.3f}")
 
         train_loss = train(
             epoch,
@@ -277,8 +308,7 @@ def gpu_worker(local_rank, node, args):
             device,
             args,
         )
-        # if epoch % 10 == 0 or epoch == 0:
-        #     torch.cuda.memory._dump_snapshot("state_file_{}_memory.pickle".format(epoch + 1))
+
         epoch_loss = train_loss
 
         if rank == 0:
@@ -312,7 +342,7 @@ def gpu_worker(local_rank, node, args):
             del state
 
             tmp_link = "{}.pt".format(time.time())
-            os.symlink(state_file, tmp_link)  # workaround to overwrite
+            os.symlink(state_file, tmp_link)
             os.rename(tmp_link, ckpt_link)
 
     dist.destroy_process_group()
@@ -335,14 +365,6 @@ def train(
     device,
     args,
 ):
-    # Adaptive hyperparameters based on progressive training
-    if hasattr(model.module, 'progressive_alpha'):
-        alpha = model.module.progressive_alpha
-        # Reduce noise injection strength during fade-in
-        if alpha < 0.5 and hasattr(model.module, 'inject_noise'):
-            # Temporarily reduce noise during early fade-in
-            # This is a training-time adjustment, not a model parameter change
-            pass
     EUL_SCALE_FACTOR = 2
     MESHSIZE = args.target_meshsize
     epoch_start_time = time.time()
@@ -360,10 +382,6 @@ def train(
             args.log_interval // args.adv_wgan_gp_interval * args.adv_wgan_gp_interval
         )
 
-    # loss, loss_adv, adv_loss, adv_loss_fake, adv_loss_real
-    # loss: generator (model) supervised loss
-    # loss_adv: generator (model) adversarial loss
-    # adv_loss: discriminator (adv_model) loss
     epoch_loss = torch.zeros(5, dtype=torch.float32, device=device)
     fake = torch.zeros([1], dtype=torch.float32, device=device)
     real = torch.ones([1], dtype=torch.float32, device=device)
@@ -380,26 +398,49 @@ def train(
         target = target.to(device, non_blocking=True)
         style = style.to(device, non_blocking=True)
 
-        output = model(input, style)
+        # Extract control inputs from the data
+        # Assume control inputs are included in the input or separately in data
+        if hasattr(args, 'control_from_target') and args.control_from_target:
+            # Use target as control (e.g., for style transfer)
+            control = target
+        elif hasattr(args, 'control_key') and args.control_key in data:
+            # Control is provided separately in data
+            control = data[args.control_key].to(device, non_blocking=True)
+        else:
+            # Use input as control (default behavior)
+            control = input
+
+        # Handle multi-scale control
+        if hasattr(model.module, 'control_channels_list'):
+            # Split control into multiple control inputs
+            controls = []
+            start_idx = 0
+            for control_chan in model.module.control_channels_list:
+                end_idx = start_idx + control_chan
+                controls.append(control[:, start_idx:end_idx])
+                start_idx = end_idx
+            output = model(input, style, controls)
+        else:
+            # Single control input
+            output = model(input, style, control)
+
         if i <= 5 or batch % 200 == 0 and rank == 0:
             print("##### batch :", batch)
             print("##### total batch :", len(loader))
             print("input shape :", input.shape)
+            print("control shape :", control.shape if not isinstance(control, list) else [c.shape for c in control])
             print("output shape :", output.shape)
             print("target shape :", target.shape)
             print("style shape :", style.shape)
 
-        if hasattr(model.module, "scale_factor") and model.module.scale_factor != 1:
-            input_resampled = resample(input, model.module.scale_factor, narrow=False)
-            # Store reference to original input before reassignment
+        if hasattr(model.module.generator, "scale_factor") and model.module.generator.scale_factor != 1:
+            input_resampled = resample(input, model.module.generator.scale_factor, narrow=False)
             orig_input = input
             input = input_resampled
-            del orig_input, input_resampled  # Clean up
+            del orig_input, input_resampled
             
-        # Store original shapes for cleanup
         input_orig, output_orig, target_orig = input, output, target
         input, output, target = narrow_cast(input, output, target)
-        # Clean up original tensors if shapes changed
         if input.shape != input_orig.shape:
             del input_orig, output_orig, target_orig
         if i <= 5 and rank == 0:
@@ -409,11 +450,42 @@ def train(
         epoch_loss[0] += loss.detach()
 
         if args.adv and epoch >= args.adv_start:
-            with torch.set_grad_enabled(True):  # Ensure proper gradient flow
+            current_scale = model.module.generator.scale_factor
+            target_scale = 8
+            
+            if current_scale < target_scale:
+                upscale_ratio = target_scale // current_scale
+                print(f"Upsampling {current_scale}x to {target_scale}x (ratio: {upscale_ratio})")
+                
+                output_orig = output
+                target_orig = target
+                input_orig = input
+                
+                output = F.interpolate(
+                    output_orig, 
+                    scale_factor=upscale_ratio, 
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                target = F.interpolate(
+                    target_orig,
+                    scale_factor=upscale_ratio,
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                input = F.interpolate(
+                    input_orig,
+                    scale_factor=upscale_ratio,
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                
+                del output_orig, target_orig, input_orig
+            
+            with torch.set_grad_enabled(True):
                 lag_out = output[:, :3]
                 lag_tgt = target[:, :3]
                 
-                # Convert Lagrangian to Eulerian
                 eul_out = lag2eul(
                     lag_out,
                     a=np.float64(style),
@@ -430,26 +502,21 @@ def train(
                     inv_shuffle=True,
                 )[0]
                 
-                # Store original tensors for cleanup
                 output_orig = output
                 target_orig = target
                 
-                # Concatenate Eulerian outputs
                 output = torch.cat([output, eul_out], dim=1)
                 target = torch.cat([target, eul_tgt], dim=1)
                 
-                # Clean up intermediate tensors
                 del lag_out, lag_tgt, eul_out, eul_tgt
                 
                 if output_orig.shape != output.shape:
                     del output_orig, target_orig
 
                 if args.cgan:
-                    # Store for cleanup
                     output_orig = output
                     target_orig = target
                     
-                    # Concatenate with input for conditional GAN
                     output = torch.cat([input, output], dim=1)
                     target = torch.cat([input, target], dim=1)
                     
@@ -473,8 +540,6 @@ def train(
             epoch_loss[2] += adv_loss.detach()
 
             if args.adv_wgan_gp_interval > 0 and batch % args.adv_wgan_gp_interval == 0:
-                # adv_loss_reg = wgan_grad_penalty(adv_model, output, target, style=style)
-                # adv_loss_reg, grad_norm_inf = hinge_grad_penalty(adv_model, output, target, style=style)
                 adv_loss_reg = r1_regularization(adv_model, target, style=style)
                 adv_loss_reg_ = adv_loss_reg * args.adv_wgan_gp_interval
 
@@ -495,7 +560,6 @@ def train(
             adv_optimizer.step()
             adv_grads = get_grads(adv_model)
 
-            # generator adversarial loss
             if batch % args.adv_iter_ratio == 0:
                 set_requires_grad(adv_model, False)
 
@@ -509,7 +573,6 @@ def train(
                 try:
                     grads = get_grads(model)
                 except Exception as e:
-                    # print(f"Error getting gradients: {e}")
                     grads = [0, 0]
         else:
             optimizer.zero_grad(set_to_none=True)
@@ -518,14 +581,12 @@ def train(
             try:
                 grads = get_grads(model)
             except Exception as e:
-                # print(f"Error getting gradients: {e}")
                 grads = [0, 0]
 
         if batch % args.log_interval == 0:
             dist.all_reduce(loss)
             loss /= world_size
             if rank == 0:
-                # === Loss Metrics ===
                 logger.add_scalar(
                     "Loss/Generator/L2", loss.detach(), global_step=batch
                 )
@@ -545,7 +606,6 @@ def train(
                     logger.add_scalar(
                         "Loss/Discriminator/Real", adv_loss_real.detach(), global_step=batch
                     )
-                    # Discriminator accuracy metrics
                     with torch.no_grad():
                         d_real_acc = (score_tgt > 0).float().mean()
                         d_fake_acc = (score_out < 0).float().mean()
@@ -560,7 +620,13 @@ def train(
                         "Metrics/Discriminator/TotalAccuracy", d_total_acc, global_step=batch
                     )
 
-                # === Gradient Metrics ===
+                # Control-specific metrics
+                if hasattr(args, 'control_strength_schedule') and args.control_strength_schedule:
+                    control_strength = min(1.0, epoch / getattr(args, 'control_warmup_epochs', 100))
+                    logger.add_scalar(
+                        "Control/Strength", control_strength, global_step=batch
+                    )
+
                 logger.add_scalar(
                     "Gradients/Generator/FirstLayer", grads[0], global_step=batch
                 )
@@ -574,23 +640,11 @@ def train(
                     logger.add_scalar(
                         "Gradients/Discriminator/LastLayer", adv_grads[-1], global_step=batch
                     )
-                    # Gradient ratio for monitoring training balance
                     grad_ratio = grads[-1] / (adv_grads[-1] + 1e-8)
                     logger.add_scalar(
                         "Gradients/G_D_Ratio", grad_ratio, global_step=batch
                     )
                 
-                # === Progressive Training Metrics ===
-                if hasattr(model.module, 'progressive_alpha'):
-                    logger.add_scalar(
-                        "Progressive/Generator_Alpha", model.module.progressive_alpha, global_step=batch
-                    )
-                if args.adv and hasattr(adv_model.module, 'progressive_alpha'):
-                    logger.add_scalar(
-                        "Progressive/Discriminator_Alpha", adv_model.module.progressive_alpha, global_step=batch
-                    )
-                
-                # === Learning Rate Tracking ===
                 logger.add_scalar(
                     "LearningRate/Generator", optimizer.param_groups[0]['lr'], global_step=batch
                 )
@@ -602,7 +656,6 @@ def train(
     dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
-        # === Epoch Summary Metrics ===
         logger.add_scalar(
             "Epoch/Loss/Generator/L2", epoch_loss[0], global_step=epoch + 1
         )
@@ -619,7 +672,6 @@ def train(
             logger.add_scalar(
                 "Epoch/Loss/Discriminator/Real", epoch_loss[4], global_step=epoch + 1
             )
-            # Loss balance metric
             loss_balance = epoch_loss[1] / (epoch_loss[2] + 1e-8)
             logger.add_scalar(
                 "Epoch/Metrics/LossBalance_G_D", loss_balance, global_step=epoch + 1
@@ -629,8 +681,7 @@ def train(
             skip_chan = sum(args.in_chan)
             output = output[:, skip_chan:]
             target = target[:, skip_chan:]
-        # input: 1, 6, 128, 128, 128
-        # output: 1,
+
         try:
             with torch.no_grad():
                 input_disp = input[-1, :3][None, :]
@@ -695,10 +746,8 @@ def train(
             logger.add_figure("Visualization/Fields", fig, global_step=epoch + 1)
             fig.clf()
             
-            # === Physical Metrics for Cosmological Fields (reduced frequency) ===
-            if epoch % 5 == 0:  # Only compute every 5 epochs to save memory
+            if epoch % 5 == 0:
                 with torch.no_grad():
-                    # Compute only essential relative errors
                     disp_rel_error = torch.norm(output_disp - tgt_disp) / (torch.norm(tgt_disp) + 1e-8)
                     vel_rel_error = torch.norm(output_vel - tgt_vel) / (torch.norm(tgt_vel) + 1e-8)
                     
@@ -709,8 +758,6 @@ def train(
                         "Physics/RelativeError/Velocity", vel_rel_error, global_step=epoch + 1
                     )
                     
-                    # Skip memory-intensive divergence computation
-                    # Field statistics (reduced)
                     logger.add_scalar(
                         "Physics/OutputStd/Velocity", output_vel.std(), global_step=epoch + 1
                     )
@@ -718,36 +765,29 @@ def train(
         except Exception as error:
             print("Error encountered in plotting/metrics: ", error)
 
-        # === Weight and Activation Histograms (log every 50 epochs, only key layers) ===
         if epoch % 50 == 0:
-            # Only log key generator layers to save memory
             for name, param in model.named_parameters():
                 if ('conv' in name or 'fc' in name) and 'weight' in name and param.grad is not None:
-                    # Only log first 3 and last 3 layers
                     layer_parts = name.split('.')
                     if any(x in layer_parts[0] for x in ['0', '1', '2']) or any(x in layer_parts[-2] for x in ['final', 'out', 'last']):
-                        logger.add_histogram(f'Weights/Generator/{name}', param.data, global_step=epoch + 1)
+                        logger.add_histogram(f'Weights/ControlNet/{name}', param.data, global_step=epoch + 1)
             
             if args.adv and epoch >= args.adv_start:
-                # Only log key discriminator layers
                 for name, param in adv_model.named_parameters():
                     if ('conv' in name or 'fc' in name) and 'weight' in name and param.grad is not None:
                         layer_parts = name.split('.')
                         if any(x in layer_parts[0] for x in ['0', '1', '2']) or any(x in layer_parts[-2] for x in ['final', 'out', 'last']):
                             logger.add_histogram(f'Weights/Discriminator/{name}', param.data, global_step=epoch + 1)
         
-        # === Memory Usage Tracking ===
         if torch.cuda.is_available():
-            memory_allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
-            memory_cached = torch.cuda.memory_reserved(device) / 1024**3  # GB
+            memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+            memory_cached = torch.cuda.memory_reserved(device) / 1024**3
             logger.add_scalar("System/GPU_Memory_Allocated_GB", memory_allocated, global_step=epoch + 1)
             logger.add_scalar("System/GPU_Memory_Cached_GB", memory_cached, global_step=epoch + 1)
         
-        # === Training Time ===
         logger.add_scalar("System/Epoch_Duration_Minutes", (time.time() - epoch_start_time) / 60, global_step=epoch + 1)
 
     return epoch_loss
-
 
 
 def dist_init(rank, args, local_rank):
@@ -772,7 +812,7 @@ def dist_init(rank, args, local_rank):
         while not os.path.exists(dist_file):
             time.sleep(1)
             timeout_count += 1
-            if timeout_count > 60:  # 1 minute timeout
+            if timeout_count > 60:
                 raise TimeoutError(f"Rank {rank}: Timed out waiting for dist_file")
         
         with open(dist_file, mode="r") as f:
@@ -794,74 +834,6 @@ def dist_init(rank, args, local_rank):
     if rank == 0:
         os.remove(dist_file)
 
-# def dist_init(rank, args, local_rank):
-#     dist_file = "dist_addr"
-    
-
-#     if rank == 0:
-#         addr = socket.gethostname()
-
-#         with socket.socket() as s:
-#             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-#             s.bind((addr, 0))
-#             _, port = s.getsockname()
-
-#         args.dist_addr = "tcp://{}:{}".format(addr, port)
-
-#         with open(dist_file, mode="w") as f:
-#             f.write(args.dist_addr)
-#     else:
-#         while not os.path.exists(dist_file):
-#             time.sleep(1)
-
-#         with open(dist_file, mode="r") as f:
-#             args.dist_addr = f.read()
-
-#     dist.init_process_group(
-#         backend=args.dist_backend,
-#         init_method=args.dist_addr,
-#         world_size=args.world_size,
-#         rank=rank,
-#         # device_id=local_rank  # Add this line to specify the device ID
-#     )
-#     dist.barrier(device_ids=[local_rank])
-
-#     if rank == 0:
-#         os.remove(dist_file)
-
-
-def init_weights(m):
-    if isinstance(
-        m,
-        (
-            nn.Linear,
-            nn.Conv1d,
-            nn.Conv2d,
-            nn.Conv3d,
-            nn.ConvTranspose1d,
-            nn.ConvTranspose2d,
-            nn.ConvTranspose3d,
-        ),
-    ):
-        m.weight.data.normal_(0.0, args.init_weight_std)
-    elif isinstance(
-        m,
-        (
-            nn.BatchNorm1d,
-            nn.BatchNorm2d,
-            nn.BatchNorm3d,
-            nn.SyncBatchNorm,
-            nn.LayerNorm,
-            nn.GroupNorm,
-            nn.InstanceNorm1d,
-            nn.InstanceNorm2d,
-            nn.InstanceNorm3d,
-        ),
-    ):
-        if m.affine:
-            m.weight.data.normal_(1.0, args.init_weight_std)
-            m.bias.data.fill_(0)
-
 
 def set_requires_grad(module, requires_grad=False):
     for param in module.parameters():
@@ -869,8 +841,12 @@ def set_requires_grad(module, requires_grad=False):
 
 
 def get_grads(model):
-    """gradients of the weights of the first and the last layer"""
-    grads = list(p.grad for n, p in model.named_parameters() if ".weight" in n)
-    grads = [grads[0], grads[-1]]
+    grads = list(p.grad for n, p in model.named_parameters() if ".weight" in n and p.grad is not None)
+    if len(grads) >= 2:
+        grads = [grads[0], grads[-1]]
+    elif len(grads) == 1:
+        grads = [grads[0], grads[0]]
+    else:
+        grads = [torch.tensor(0.0), torch.tensor(0.0)]
     grads = [g.detach().norm() for g in grads]
     return grads
