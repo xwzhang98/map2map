@@ -34,7 +34,7 @@ class G(nn.Module):
             self.blocks.append(
                 HBlock(prev_chan, next_chan, out_chan, cat_noise))
 
-    def forward(self, x):
+    def forward(self, x, s=None):
         y = x  # direct upsampling from the input
         x = self.block0(x)
 
@@ -172,7 +172,7 @@ class D(nn.Module):
             nn.Conv3d(chan(-1), 1, 1),
         )
 
-    def forward(self, x):
+    def forward(self, x, s=None):
         x = self.block0(x)
 
         for block in self.blocks:

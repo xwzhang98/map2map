@@ -13,8 +13,8 @@ def lag2eul(
     periodic=False,
     a=0.3333,
     dis_std=6.0 * 1e3,  # in Kpc/h
-    boxsize=100.0 * 1e3,  # in K[c/h
-    meshsize=512,
+    boxsize=100.0 * 1e3,  # in Kpc/h
+    meshsize=256,
     inv_shuffle=True,
     **kwargs
 ):

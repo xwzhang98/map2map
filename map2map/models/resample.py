@@ -8,9 +8,8 @@ def resample(x, scale_factor, narrow=True):
     modes = {1: 'linear', 2: 'bilinear', 3: 'trilinear'}
     ndim = x.dim() - 2
     mode = modes[ndim]
-
     x = F.interpolate(x, scale_factor=scale_factor,
-                      mode=mode, align_corners=False)
+                      mode=mode)
 
     if scale_factor > 1 and narrow == True:
         edges = round(scale_factor) // 2
@@ -30,13 +29,12 @@ class Resampler(nn.Module):
 
         modes = {1: 'linear', 2: 'bilinear', 3: 'trilinear'}
         self.mode = modes[ndim]
-
         self.scale_factor = scale_factor
         self.narrow = narrow
 
     def forward(self, x):
         x = F.interpolate(x, scale_factor=self.scale_factor,
-                          mode=self.mode, align_corners=False)
+                          mode=self.mode)
 
         if self.scale_factor > 1 and self.narrow == True:
             edges = round(self.scale_factor) // 2
@@ -58,7 +56,6 @@ class Resampler2(nn.Module):
 
         modes = {1: 'linear', 2: 'bilinear', 3: 'trilinear'}
         self.mode = modes[ndim]
-
         self.scale_factor = scale_factor
         self.narrow = narrow
 

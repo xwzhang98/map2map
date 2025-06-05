@@ -53,7 +53,7 @@ class FieldDataset(Dataset):
                  in_pad=0, tgt_pad=0, scale_factor=1,
                  **kwargs):
         #you can adjust the random seed to randomize the in pattern sequence
-        sampling = True
+        sampling = False
         in_file_lists = [sorted(glob(p)) for p in in_patterns]
 
         num_snapshots = len(in_file_lists[0])
@@ -74,6 +74,7 @@ class FieldDataset(Dataset):
             self.tgt_files = list(zip(*tgt_file_lists))
 
         if len(self.in_files) != len(self.tgt_files):
+            print(len(self.in_files), len(self.tgt_files))
             raise ValueError('number of input and target fields do not match')
         self.nfile = len(self.in_files)
 

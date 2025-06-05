@@ -5,6 +5,7 @@ from torch.nn.init import kaiming_normal
 
 from .style import ModulatedConv3d
 from .resample import Resampler
+from .narrow import narrow_by
 
 def normalization(channels):
     # For channels <= 32, use GroupNorm with channels/4 groups
@@ -110,6 +111,7 @@ class HBlock(nn.Module):
         inject_noise=True,
         use_normalize=False,
         use_attention=False,
+        use_pixel_shuffle=False,
         which_attention="linear",
     ):
         super().__init__()
@@ -119,6 +121,17 @@ class HBlock(nn.Module):
         self.upsample = Resampler(ndim=3, scale_factor=2, narrow=True)
         self.use_normalize = use_normalize
         self.use_attention = use_attention
+        self.use_pixel_shuffle = use_pixel_shuffle
+        
+        
+        if self.use_pixel_shuffle:
+            self.x_upconv = nn.Conv3d(
+                prev_chan,
+                prev_chan * 8,
+                kernel_size=3,
+                padding=1,
+            )
+            self.pixel_shuffle = PixelShuffle3D(upscale_factor=2)
 
         if self.inject_noise:
             self.noise1 = NoiseInjection()
@@ -163,7 +176,12 @@ class HBlock(nn.Module):
 
     def forward(self, x, y, s):
         # left branch:
-        x = self.upsample(x)
+        if self.use_pixel_shuffle:
+            x = self.x_upconv(x, s)
+            x = self.pixel_shuffle(x)
+            x = narrow_by(x, 1)
+        else:
+            x = self.upsample(x)
         # block 1
         # ---------------------
         x = self.conv1(x, s)
@@ -190,6 +208,27 @@ class HBlock(nn.Module):
         y = narrow_as(y, x)
         y = y + self.proj_act(self.proj(x, s))
         return x, y
+
+
+class PixelShuffle3D(nn.Module):
+    """3D pixel shuffle layer for upsampling."""
+    def __init__(self, upscale_factor):
+        super().__init__()
+        self.upscale_factor = upscale_factor
+        
+    def forward(self, x):
+        batch_size, channels, depth, height, width = x.size()
+        r = self.upscale_factor
+        
+        # Reshape to prepare for shuffling
+        out_channels = channels // (r**3)
+        x = x.view(batch_size, out_channels, r, r, r, depth, height, width)
+        
+        # Permute and reshape to get the upscaled output
+        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+        x = x.view(batch_size, out_channels, depth*r, height*r, width*r)
+        
+        return x
 
 
 class SelfAttention3D(nn.Module):
@@ -258,12 +297,13 @@ class G(nn.Module):
         style_size,
         embedding_size=16,
         scale_factor=8,
+        previous_scale_factor=2,
         chan_base=512,
         chan_min=64,
         chan_max=512,
         inject_noise=True,
         use_normalize=False,
-        use_attention=True,
+        use_attention=False,
         **kwargs
     ):
         super().__init__()
@@ -275,6 +315,7 @@ class G(nn.Module):
         self.scale_factor = scale_factor
         num_blocks = round(math.log2(self.scale_factor))
         self.num_blocks = num_blocks
+        print(f"num_blocks: {num_blocks}")
         self.inject_noise = inject_noise
         self.use_normalize = use_normalize
         assert chan_min <= chan_max
@@ -323,6 +364,23 @@ class G(nn.Module):
                     use_attention=use_attn_in_this_block
                 )
             )
+            
+            
+        # freeze the previous scale factor blocks
+        if previous_scale_factor > 0:
+            # Calculate how many blocks to freeze
+            prev_num_blocks = round(math.log2(previous_scale_factor))
+            print(f"prev_num_blocks: {prev_num_blocks}")
+            # Freeze only the EARLY blocks, not head/style embedding
+            for b in range(prev_num_blocks):
+                for param in self.blocks[b].parameters():
+                    param.requires_grad = False
+                    
+            # Keep head and style_embed trainable - they need to adapt to new layers
+            # self.head.requires_grad_(True)  # This is default
+            # self.style_embed.requires_grad_(True)  # This is default
+            
+            print(f"Frozen {prev_num_blocks} blocks for progressive training")
 
     def forward(self, x, style):
         s = self.style_embed(style)
@@ -493,7 +551,7 @@ class D(nn.Module):
         chan_base=512,
         chan_min=64,
         chan_max=512,
-        use_normalize=True,
+        use_normalize=False,
         **kwargs
     ):
         super().__init__()
@@ -501,13 +559,13 @@ class D(nn.Module):
         self.in_chan = in_chan
         self.out_chan = out_chan
         self.style_size = style_size
-        self.scale_factor = scale_factor
+        # self.scale_factor = scale_factor
+        self.scale_factor = 8 # WARNING: hardcoded for fixed discriminator architecture
         num_blocks = round(math.log2(self.scale_factor))
         self.num_blocks = num_blocks
         self.embedding_size = embedding_size
         self.use_normalize = use_normalize
         assert chan_min <= chan_max
-
         def chan(b):
             if b >= 0:
                 c = chan_base >> b

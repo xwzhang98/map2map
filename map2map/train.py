@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.multiprocessing import spawn
 from torch.nn.parallel import DistributedDataParallel
@@ -21,6 +22,7 @@ from .models import (
     resample,
     lag2eul,
     wgan_grad_penalty,
+    hinge_grad_penalty,
     r1_regularization,
 )
 from .utils import import_attr, load_model_state_dict, plt_slices, plt_power
@@ -52,6 +54,7 @@ def gpu_worker(local_rank, node, args):
     print("args.gpus_per_node", args.gpus_per_node)
     print("device_count", torch.cuda.device_count())
     print("args.world_size", args.world_size)
+    print("gpu name", torch.cuda.get_device_name(local_rank))
     
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     # Don't set CUDA_VISIBLE_DEVICES
@@ -109,11 +112,13 @@ def gpu_worker(local_rank, node, args):
     args.style_size = train_dataset.style_size
 
     model = import_attr(args.model, models, callback_at=args.callback_at)
+
     model = model(
         sum(args.in_chan),
         sum(args.out_chan),
         style_size=args.style_size,
         scale_factor=args.scale_factor,
+        previous_scale_factor=args.previous_scale_factor,
         **args.misc_kwargs,
     )
     model.to(device)
@@ -239,6 +244,8 @@ def gpu_worker(local_rank, node, args):
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
+        # if epoch % 10 == 0 or epoch == 0:
+        #     torch.cuda.memory._record_memory_history()
 
         train_loss = train(
             epoch,
@@ -255,6 +262,8 @@ def gpu_worker(local_rank, node, args):
             device,
             args,
         )
+        # if epoch % 10 == 0 or epoch == 0:
+        #     torch.cuda.memory._dump_snapshot("state_file_{}_memory.pickle".format(epoch + 1))
         epoch_loss = train_loss
 
         if rank == 0:
@@ -283,6 +292,7 @@ def gpu_worker(local_rank, node, args):
                 )
 
             state_file = "state_{}.pt".format(epoch + 1)
+            
             torch.save(state, state_file)
             del state
 
@@ -291,6 +301,8 @@ def gpu_worker(local_rank, node, args):
             os.rename(tmp_link, ckpt_link)
 
     dist.destroy_process_group()
+    
+    torch.cuda.empty_cache()
 
 
 def train(
@@ -309,6 +321,7 @@ def train(
     args,
 ):
     EUL_SCALE_FACTOR = 2
+    MESHSIZE = args.target_meshsize
 
     model.train()
     if args.adv:
@@ -353,8 +366,18 @@ def train(
             print("style shape :", style.shape)
 
         if hasattr(model.module, "scale_factor") and model.module.scale_factor != 1:
-            input = resample(input, model.module.scale_factor, narrow=False)
+            input_resampled = resample(input, model.module.scale_factor, narrow=False)
+            # Store reference to original input before reassignment
+            orig_input = input
+            input = input_resampled
+            del orig_input, input_resampled  # Clean up
+            
+        # Store original shapes for cleanup
+        input_orig, output_orig, target_orig = input, output, target
         input, output, target = narrow_cast(input, output, target)
+        # Clean up original tensors if shapes changed
+        if input.shape != input_orig.shape:
+            del input_orig, output_orig, target_orig
         if i <= 5 and rank == 0:
             print("narrowed shape :", output.shape, flush=True)
 
@@ -362,28 +385,89 @@ def train(
         epoch_loss[0] += loss.detach()
 
         if args.adv and epoch >= args.adv_start:
-            lag_out = output[:, :3]
-            eul_out = lag2eul(
-                lag_out,
-                a=np.float64(style),
-                eul_scale_factor=EUL_SCALE_FACTOR,
-                inv_shuffle=True,
-            )[0]
-            lag_tgt = target[:, :3]
-            eul_tgt = lag2eul(
-                lag_tgt,
-                a=np.float64(style),
-                eul_scale_factor=EUL_SCALE_FACTOR,
-                inv_shuffle=True,
-            )[0]
+            # Check if we need to upsample for discriminator
+            current_scale = model.module.scale_factor
+            target_scale = 8  # e.g., 8
+            
+            if current_scale < target_scale:
+                upscale_ratio = target_scale // current_scale
+                print(f"Upsampling {current_scale}x to {target_scale}x (ratio: {upscale_ratio})")
+                
+                # Store original tensors
+                output_orig = output
+                target_orig = target
+                input_orig = input
+                
+                # Upsample generator output and target for discriminator
+                output = F.interpolate(
+                    output_orig, 
+                    scale_factor=upscale_ratio, 
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                target = F.interpolate(
+                    target_orig,
+                    scale_factor=upscale_ratio,
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                input = F.interpolate(
+                    input_orig,
+                    scale_factor=upscale_ratio,
+                    mode='trilinear', 
+                    align_corners=False
+                )
+                
+                # Clean up original tensors
+                del output_orig, target_orig, input_orig
+            
+            
+            with torch.set_grad_enabled(True):  # Ensure proper gradient flow
+                lag_out = output[:, :3]
+                lag_tgt = target[:, :3]
+                
+                # Convert Lagrangian to Eulerian
+                eul_out = lag2eul(
+                    lag_out,
+                    a=np.float64(style),
+                    meshsize=MESHSIZE,
+                    eul_scale_factor=EUL_SCALE_FACTOR,
+                    inv_shuffle=True,
+                )[0]
+                
+                eul_tgt = lag2eul(
+                    lag_tgt,
+                    a=np.float64(style),
+                    meshsize=MESHSIZE,
+                    eul_scale_factor=EUL_SCALE_FACTOR,
+                    inv_shuffle=True,
+                )[0]
+                
+                # Store original tensors for cleanup
+                output_orig = output
+                target_orig = target
+                
+                # Concatenate Eulerian outputs
+                output = torch.cat([output, eul_out], dim=1)
+                target = torch.cat([target, eul_tgt], dim=1)
+                
+                # Clean up intermediate tensors
+                del lag_out, lag_tgt, eul_out, eul_tgt
+                
+                if output_orig.shape != output.shape:
+                    del output_orig, target_orig
 
-            output = torch.cat([output, eul_out], dim=1)
-            target = torch.cat([target, eul_tgt], dim=1)
-
-            if args.cgan:
-                output = torch.cat([input, output], dim=1)
-                target = torch.cat([input, target], dim=1)
-                # the output and target array is now [input, output/target, eul_out/eul_tgt]
+                if args.cgan:
+                    # Store for cleanup
+                    output_orig = output
+                    target_orig = target
+                    
+                    # Concatenate with input for conditional GAN
+                    output = torch.cat([input, output], dim=1)
+                    target = torch.cat([input, target], dim=1)
+                    
+                    if output_orig.shape != output.shape:
+                        del output_orig, target_orig
 
             set_requires_grad(adv_model, True)
 
@@ -403,6 +487,7 @@ def train(
 
             if args.adv_wgan_gp_interval > 0 and batch % args.adv_wgan_gp_interval == 0:
                 # adv_loss_reg = wgan_grad_penalty(adv_model, output, target, style=style)
+                # adv_loss_reg, grad_norm_inf = hinge_grad_penalty(adv_model, output, target, style=style)
                 adv_loss_reg = r1_regularization(adv_model, target, style=style)
                 adv_loss_reg_ = adv_loss_reg * args.adv_wgan_gp_interval
 
@@ -414,6 +499,11 @@ def train(
                         adv_loss_reg.detach(),
                         global_step=batch,
                     )
+                    # logger.add_scalar(
+                    #     "batch/grad/adv/gradient_penalty",
+                    #     grad_norm_inf.detach(),
+                    #     global_step=batch,
+                    # )
 
             adv_optimizer.step()
             adv_grads = get_grads(adv_model)
@@ -427,14 +517,22 @@ def train(
                 epoch_loss[1] += args.adv_iter_ratio * loss_adv.detach()
 
                 optimizer.zero_grad(set_to_none=True)
-                loss_adv.backward()
+                (0.01*loss + loss_adv).backward()
                 optimizer.step()
-                grads = get_grads(model)
+                try:
+                    grads = get_grads(model)
+                except Exception as e:
+                    # print(f"Error getting gradients: {e}")
+                    grads = [0, 0]
         else:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            grads = get_grads(model)
+            try:
+                grads = get_grads(model)
+            except Exception as e:
+                # print(f"Error getting gradients: {e}")
+                grads = [0, 0]
 
         if batch % args.log_interval == 0:
             dist.all_reduce(loss)
@@ -511,18 +609,21 @@ def train(
                 input_eul = lag2eul(
                     input_disp,
                     a=np.float64(style),
+                    meshsize=MESHSIZE,
                     eul_scale_factor=EUL_SCALE_FACTOR,
                     inv_shuffle=False,
                 )[0]
                 output_eul = lag2eul(
                     output_disp,
                     a=np.float64(style),
+                    meshsize=MESHSIZE,
                     eul_scale_factor=EUL_SCALE_FACTOR,
                     inv_shuffle=False,
                 )[0]
                 tgt_eul = lag2eul(
                     tgt_disp,
                     a=np.float64(style),
+                    meshsize=MESHSIZE,
                     eul_scale_factor=EUL_SCALE_FACTOR,
                     inv_shuffle=False,
                 )[0]

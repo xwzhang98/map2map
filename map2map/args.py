@@ -64,6 +64,12 @@ def add_common_args(parser):
     parser.add_argument('--scale-factor', default=1, type=int,
             help='upsampling factor for super-resolution, in which case '
             'crop and pad are sizes of the input resolution')
+    parser.add_argument('--previous-scale-factor', default=0, type=int,
+            help='previous scale factor for super-resolution, in which case '
+            'crop and pad are sizes of the previous resolution, only when progressive training is used')
+    parser.add_argument('--target-meshsize', default=512, type=int,
+            help='target meshsize for super-resolution, in which case '
+            'crop and pad are sizes of the target resolution')
 
     parser.add_argument('--model', type=str, required=True,
             help='(generator) model')
@@ -185,7 +191,7 @@ def add_train_args(parser):
             'Change this to balance cache locality and stochasticity')
     parser.add_argument('--dist-backend', default='nccl', type=str,
             choices=['gloo', 'nccl'], help='distributed backend')
-    parser.add_argument('--log-interval', default=100, type=int,
+    parser.add_argument('--log-interval', default=10, type=int,
             help='interval (batches) between logging training loss')
     parser.add_argument('--detect-anomaly', action='store_true',
             help='enable anomaly detection for the autograd engine')

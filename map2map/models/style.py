@@ -276,12 +276,20 @@ class ModulatedConv3d(nn.Module):
             nn.SiLU(),
             nn.Linear(embedding_size, in_chan),
         )
+        # Initialize style embedding weights and bias
+        for layer in self.embed_layers:
+            if isinstance(layer, nn.Linear):
+                torch.nn.init.kaiming_uniform_(
+                    layer.weight, a=math.sqrt(5), mode="fan_in", nonlinearity="leaky_relu"
+                )
+                if layer.bias is not None:
+                    torch.nn.init.zeros_(layer.bias)  # Standard: zeros
 
     def forward(self, x, style):
         # x shape N, C, D, H, W
         # style shape N, embedding_size
         s = self.embed_layers(style)  # N, in_chan
-        eps = 1e-16
+        eps = 1e-8
 
         batch, _, *DHW_in = x.shape
         w = self.weight
@@ -356,12 +364,19 @@ class ModulatedConv3dBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(embedding_size, in_chan),
         )
+        for layer in self.embed_layers:
+            if isinstance(layer, nn.Linear):
+                torch.nn.init.kaiming_uniform_(
+                    layer.weight, a=math.sqrt(5), mode="fan_in", nonlinearity="leaky_relu"
+                )
+                if layer.bias is not None:
+                    torch.nn.init.zeros_(layer.bias)  # Standard: zeros
 
     def forward(self, x, style):
         # x shape N, C, D, H, W
         # style shape N, embedding_size
         s = self.embed_layers(style)  # N, in_chan
-        eps = 1e-16
+        eps = 1e-8
 
         batch, _, *DHW_in = x.shape
         w = self.weight
