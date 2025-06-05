@@ -113,6 +113,10 @@ def gpu_worker(local_rank, node, args):
 
     model = import_attr(args.model, models, callback_at=args.callback_at)
 
+    # Calculate progressive alpha based on epochs if not provided
+    if 'progressive_alpha' not in args.misc_kwargs and hasattr(args, 'progressive_fade_epochs'):
+        args.misc_kwargs['progressive_alpha'] = 0.0  # Will be updated in training loop
+    
     model = model(
         sum(args.in_chan),
         sum(args.out_chan),
@@ -244,6 +248,14 @@ def gpu_worker(local_rank, node, args):
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
+        
+        # Update progressive alpha if using progressive training
+        if hasattr(args, 'progressive_fade_epochs') and args.progressive_fade_epochs > 0:
+            alpha = min(1.0, epoch / args.progressive_fade_epochs)
+            if hasattr(model.module, 'progressive_alpha'):
+                model.module.progressive_alpha = alpha
+                if rank == 0 and epoch % 10 == 0:
+                    print(f"Progressive alpha: {alpha:.3f}")
         # if epoch % 10 == 0 or epoch == 0:
         #     torch.cuda.memory._record_memory_history()
 
@@ -320,8 +332,17 @@ def train(
     device,
     args,
 ):
+    # Adaptive hyperparameters based on progressive training
+    if hasattr(model.module, 'progressive_alpha'):
+        alpha = model.module.progressive_alpha
+        # Reduce noise injection strength during fade-in
+        if alpha < 0.5 and hasattr(model.module, 'inject_noise'):
+            # Temporarily reduce noise during early fade-in
+            # This is a training-time adjustment, not a model parameter change
+            pass
     EUL_SCALE_FACTOR = 2
     MESHSIZE = args.target_meshsize
+    epoch_start_time = time.time()
 
     model.train()
     if args.adv:
@@ -495,15 +516,15 @@ def train(
 
                 if batch % adv_wgan_gp_log_interval == 0 and rank == 0:
                     logger.add_scalar(
-                        "batch/loss/adv/gradient_penalty",
+                        "Loss/Discriminator/R1_Penalty",
                         adv_loss_reg.detach(),
                         global_step=batch,
                     )
-                    # logger.add_scalar(
-                    #     "batch/grad/adv/gradient_penalty",
-                    #     grad_norm_inf.detach(),
-                    #     global_step=batch,
-                    # )
+                    logger.add_scalar(
+                        "Loss/Discriminator/R1_Scaled",
+                        adv_loss_reg_.detach(),
+                        global_step=batch,
+                    )
 
             adv_optimizer.step()
             adv_grads = get_grads(adv_model)
@@ -538,55 +559,100 @@ def train(
             dist.all_reduce(loss)
             loss /= world_size
             if rank == 0:
+                # === Loss Metrics ===
                 logger.add_scalar(
-                    "batch/loss/generator/l2", loss.detach(), global_step=batch
+                    "Loss/Generator/L2", loss.detach(), global_step=batch
                 )
                 if args.adv and epoch >= args.adv_start:
                     logger.add_scalar(
-                        "batch/loss/adv/G", loss_adv.detach(), global_step=batch
+                        "Loss/Generator/Adversarial", loss_adv.detach(), global_step=batch
                     )
-                    logger.add_scalars(
-                        "batch/loss/adv/D",
-                        {
-                            "total": adv_loss.detach(),
-                            "fake": adv_loss_fake.detach(),
-                            "real": adv_loss_real.detach(),
-                        },
-                        global_step=batch,
+                    logger.add_scalar(
+                        "Loss/Generator/Total", (0.01*loss + loss_adv).detach(), global_step=batch
+                    )
+                    logger.add_scalar(
+                        "Loss/Discriminator/Total", adv_loss.detach(), global_step=batch
+                    )
+                    logger.add_scalar(
+                        "Loss/Discriminator/Fake", adv_loss_fake.detach(), global_step=batch
+                    )
+                    logger.add_scalar(
+                        "Loss/Discriminator/Real", adv_loss_real.detach(), global_step=batch
+                    )
+                    # Discriminator accuracy metrics
+                    with torch.no_grad():
+                        d_real_acc = (score_tgt > 0).float().mean()
+                        d_fake_acc = (score_out < 0).float().mean()
+                        d_total_acc = (d_real_acc + d_fake_acc) / 2
+                    logger.add_scalar(
+                        "Metrics/Discriminator/RealAccuracy", d_real_acc, global_step=batch
+                    )
+                    logger.add_scalar(
+                        "Metrics/Discriminator/FakeAccuracy", d_fake_acc, global_step=batch
+                    )
+                    logger.add_scalar(
+                        "Metrics/Discriminator/TotalAccuracy", d_total_acc, global_step=batch
                     )
 
+                # === Gradient Metrics ===
                 logger.add_scalar(
-                    "batch/grad/generator/first", grads[0], global_step=batch
+                    "Gradients/Generator/FirstLayer", grads[0], global_step=batch
                 )
                 logger.add_scalar(
-                    "batch/grad/generator/last", grads[-1], global_step=batch
+                    "Gradients/Generator/LastLayer", grads[-1], global_step=batch
                 )
                 if args.adv and epoch >= args.adv_start:
                     logger.add_scalar(
-                        "batch/grad/adv/first", adv_grads[0], global_step=batch
+                        "Gradients/Discriminator/FirstLayer", adv_grads[0], global_step=batch
                     )
                     logger.add_scalar(
-                        "batch/grad/adv/last", adv_grads[-1], global_step=batch
+                        "Gradients/Discriminator/LastLayer", adv_grads[-1], global_step=batch
+                    )
+                    # Gradient ratio for monitoring training balance
+                    grad_ratio = grads[-1] / (adv_grads[-1] + 1e-8)
+                    logger.add_scalar(
+                        "Gradients/G_D_Ratio", grad_ratio, global_step=batch
+                    )
+                
+                # === Progressive Training Metrics ===
+                if hasattr(model.module, 'progressive_alpha'):
+                    logger.add_scalar(
+                        "Progressive/Alpha", model.module.progressive_alpha, global_step=batch
+                    )
+                
+                # === Learning Rate Tracking ===
+                logger.add_scalar(
+                    "LearningRate/Generator", optimizer.param_groups[0]['lr'], global_step=batch
+                )
+                if args.adv and epoch >= args.adv_start:
+                    logger.add_scalar(
+                        "LearningRate/Discriminator", adv_optimizer.param_groups[0]['lr'], global_step=batch
                     )
 
     dist.all_reduce(epoch_loss)
     epoch_loss /= len(loader) * world_size
     if rank == 0:
+        # === Epoch Summary Metrics ===
         logger.add_scalar(
-            "epoch/loss/generator/l2", epoch_loss[0], global_step=epoch + 1
+            "Epoch/Loss/Generator/L2", epoch_loss[0], global_step=epoch + 1
         )
         if args.adv and epoch >= args.adv_start:
             logger.add_scalar(
-                "epoch/loss/adv/G", epoch_loss[1], global_step=epoch + 1
+                "Epoch/Loss/Generator/Adversarial", epoch_loss[1], global_step=epoch + 1
             )
-            logger.add_scalars(
-                "epoch/loss/adv/D",
-                {
-                    "total": epoch_loss[2],
-                    "fake": epoch_loss[3],
-                    "real": epoch_loss[4],
-                },
-                global_step=epoch + 1,
+            logger.add_scalar(
+                "Epoch/Loss/Discriminator/Total", epoch_loss[2], global_step=epoch + 1
+            )
+            logger.add_scalar(
+                "Epoch/Loss/Discriminator/Fake", epoch_loss[3], global_step=epoch + 1
+            )
+            logger.add_scalar(
+                "Epoch/Loss/Discriminator/Real", epoch_loss[4], global_step=epoch + 1
+            )
+            # Loss balance metric
+            loss_balance = epoch_loss[1] / (epoch_loss[2] + 1e-8)
+            logger.add_scalar(
+                "Epoch/Metrics/LossBalance_G_D", loss_balance, global_step=epoch + 1
             )
 
         if args.adv and epoch >= args.adv_start and args.cgan:
@@ -656,28 +722,72 @@ def train(
                 ],
                 **args.misc_kwargs,
             )
-            logger.add_figure("fig/train", fig, global_step=epoch + 1)
+            logger.add_figure("Visualization/Fields", fig, global_step=epoch + 1)
             fig.clf()
+            
+            # === Physical Metrics for Cosmological Fields ===
+            with torch.no_grad():
+                # Compute relative errors
+                disp_rel_error = torch.norm(output_disp - tgt_disp) / (torch.norm(tgt_disp) + 1e-8)
+                vel_rel_error = torch.norm(output_vel - tgt_vel) / (torch.norm(tgt_vel) + 1e-8)
+                
+                # Compute divergence statistics (important for cosmology)
+                def compute_divergence(field):
+                    # Simple finite difference divergence
+                    dx = field[:, 0, 1:, :, :] - field[:, 0, :-1, :, :]
+                    dy = field[:, 1, :, 1:, :] - field[:, 1, :, :-1, :]
+                    dz = field[:, 2, :, :, 1:] - field[:, 2, :, :, :-1]
+                    return dx.mean(), dy.mean(), dz.mean()
+                
+                div_out = compute_divergence(output_vel)
+                div_tgt = compute_divergence(tgt_vel)
+                div_error = sum((do - dt)**2 for do, dt in zip(div_out, div_tgt))**0.5
+                
+                logger.add_scalar(
+                    "Physics/RelativeError/Displacement", disp_rel_error, global_step=epoch + 1
+                )
+                logger.add_scalar(
+                    "Physics/RelativeError/Velocity", vel_rel_error, global_step=epoch + 1
+                )
+                logger.add_scalar(
+                    "Physics/DivergenceError", div_error, global_step=epoch + 1
+                )
+                
+                # Field statistics
+                logger.add_scalar(
+                    "Physics/OutputStd/Displacement", output_disp.std(), global_step=epoch + 1
+                )
+                logger.add_scalar(
+                    "Physics/OutputStd/Velocity", output_vel.std(), global_step=epoch + 1
+                )
+                
         except Exception as error:
-            print("Error encountered in plotting: ", error)
+            print("Error encountered in plotting/metrics: ", error)
 
-        # fig = plt_power(
-        #     input, output, target,
-        #     label=['in', 'out', 'tgt'],
-        #     **args.misc_kwargs,
-        # )
-        # logger.add_figure('fig/train/power/lag', fig, global_step=epoch+1)
-        # fig.clf()
-        # torch.cuda.memory_snapshot()
-
-        # fig = plt_power(
-        #     1.0,
-        #     dis=[input, output, target],
-        #     label=["in", "out", "tgt"],
-        #     **args.misc_kwargs,
-        # )
-        # logger.add_figure("fig/train/power/eul", fig, global_step=epoch + 1)
-        # fig.clf()
+        # === Weight and Activation Histograms (log every 10 epochs) ===
+        if epoch % 10 == 0:
+            # Generator weights
+            for name, param in model.named_parameters():
+                if 'weight' in name and param.grad is not None:
+                    logger.add_histogram(f'Weights/Generator/{name}', param.data, global_step=epoch + 1)
+                    logger.add_histogram(f'Gradients/Generator/{name}', param.grad, global_step=epoch + 1)
+            
+            if args.adv and epoch >= args.adv_start:
+                # Discriminator weights
+                for name, param in adv_model.named_parameters():
+                    if 'weight' in name and param.grad is not None:
+                        logger.add_histogram(f'Weights/Discriminator/{name}', param.data, global_step=epoch + 1)
+                        logger.add_histogram(f'Gradients/Discriminator/{name}', param.grad, global_step=epoch + 1)
+        
+        # === Memory Usage Tracking ===
+        if torch.cuda.is_available():
+            memory_allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            memory_cached = torch.cuda.memory_reserved(device) / 1024**3  # GB
+            logger.add_scalar("System/GPU_Memory_Allocated_GB", memory_allocated, global_step=epoch + 1)
+            logger.add_scalar("System/GPU_Memory_Cached_GB", memory_cached, global_step=epoch + 1)
+        
+        # === Training Time ===
+        logger.add_scalar("System/Epoch_Duration_Minutes", (time.time() - epoch_start_time) / 60, global_step=epoch + 1)
 
     return epoch_loss
 

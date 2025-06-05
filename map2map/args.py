@@ -174,6 +174,9 @@ def add_train_args(parser):
             help='weight initialization std')
     parser.add_argument('--epochs', default=128, type=int,
             help='total number of epochs to run')
+    parser.add_argument('--progressive-fade-epochs', default=0, type=int,
+            help='number of epochs to fade in new layers during progressive training. '
+            '0 disables progressive fading')
     parser.add_argument('--seed', default=3407, type=int,
             help='seed for initializing training')
 

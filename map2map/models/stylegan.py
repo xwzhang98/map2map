@@ -125,11 +125,12 @@ class HBlock(nn.Module):
         
         
         if self.use_pixel_shuffle:
+            # Use 1x1 conv to avoid checkerboard from overlapping receptive fields
             self.x_upconv = nn.Conv3d(
                 prev_chan,
                 prev_chan * 8,
-                kernel_size=3,
-                padding=1,
+                kernel_size=1,  # Changed from 3 to 1
+                padding=0,      # Changed from 1 to 0
             )
             self.pixel_shuffle = PixelShuffle3D(upscale_factor=2)
 
@@ -177,9 +178,9 @@ class HBlock(nn.Module):
     def forward(self, x, y, s):
         # left branch:
         if self.use_pixel_shuffle:
-            x = self.x_upconv(x, s)
+            x = self.x_upconv(x)
             x = self.pixel_shuffle(x)
-            x = narrow_by(x, 1)
+            # Don't narrow when using pixel shuffle - it's exact
         else:
             x = self.upsample(x)
         # block 1
@@ -304,6 +305,7 @@ class G(nn.Module):
         inject_noise=True,
         use_normalize=False,
         use_attention=False,
+        progressive_alpha=1.0,
         **kwargs
     ):
         super().__init__()
@@ -318,6 +320,7 @@ class G(nn.Module):
         print(f"num_blocks: {num_blocks}")
         self.inject_noise = inject_noise
         self.use_normalize = use_normalize
+        self.progressive_alpha = progressive_alpha
         assert chan_min <= chan_max
 
         def chan(b):
@@ -389,8 +392,26 @@ class G(nn.Module):
         x = self.head(x, s)  # shallow feature extraction
         x = self.head_act(x)
 
-        for block in self.blocks:
-            x, y = block(x, y, s)
+        # Progressive training with alpha blending
+        if self.progressive_alpha < 1.0 and self.num_blocks > 1:
+            # Process through all blocks except the last
+            for block in self.blocks[:-1]:
+                x, y = block(x, y, s)
+            
+            # Save pre-final output for blending
+            y_prev = y
+            
+            # Process through final block
+            x, y = self.blocks[-1](x, y, s)
+            
+            # Blend between previous resolution and current
+            y = self.progressive_alpha * y + (1 - self.progressive_alpha) * F.interpolate(
+                y_prev, size=y.shape[2:], mode='trilinear', align_corners=False
+            )
+        else:
+            # Normal forward pass
+            for block in self.blocks:
+                x, y = block(x, y, s)
 
         return y
 
